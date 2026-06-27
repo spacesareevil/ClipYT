@@ -43,11 +43,19 @@ def validate_single_vod(vod):
                 return None  # Discard immediately, not vertical
                 
         # PASS 3: If it IS vertical, check captions immediately
-        # (Assuming your check_captions_exist function takes a URL)
-        if not check_captions_exist(url):
+        video_id = vod.get('id') or extract_youtube_id(url)
+        if not video_id or not check_captions_exist(video_id):
             return None # Discard, no captions
             
-        return vod # Success! It survived both checks.
+        raw_date = vod.get('upload_date', '')
+        formatted_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}" if raw_date and len(raw_date) == 8 else datetime.today().strftime('%Y-%m-%d')
+
+        return {
+            'title': vod.get('title', 'Unknown Title'),
+            'url': f"https://www.youtube.com/watch?v={video_id}",
+            'date': formatted_date,
+            'creator': vod.get('uploader', 'Unknown Creator')
+        }
         
     except Exception as e:
         print(f"Error analyzing metadata for {url}: {e}")
@@ -140,53 +148,11 @@ def _fetch_playlist_data(url: str, date_after, limit: int) -> list:
             playlist_data.append(json.loads(line))
     return playlist_data
 
-def _filter_and_format_vods(playlist_data: list, original_url: str) -> list:
-    vods = []
-    vod_count = len(playlist_data)
-    logger.debug(f"Found {vod_count} VODs. Filtering for Vertical VODs only")
-    for data in playlist_data:
-        yt_url = data.get('url')
-
-        format_cmd = ['yt-dlp', '--quiet', '--format', 'bv*[ext=mp4]','--print', '%(resolution)s', f"{yt_url}"]
-        try:
-            format_result = subprocess.run(format_cmd, capture_output=True, text=True, check=True)
-            resolution = format_result.stdout.strip()
-        except subprocess.TimeoutExpired:
-            logger.error(f"yt-dlp scan timed out after 300 seconds for {original_url}")
-            raise RuntimeError("The YouTube channel scan timed out after 5 minutes. YouTube may be throttling the connection or the channel archive is massive. Please try again.")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"yt-dlp failure: {e.stderr}")
-            raise RuntimeError(f"yt-dlp Live Stream scanning operation failure: {e.stderr}")
-
-        width_str = resolution.split("x", 1)[0]
-        height_str = resolution.partition("x")[2]
-
-        # Check for vertical aspect ratio
-        if width_str and height_str and height_str > width_str:
-            video_id = data.get('id')
-            video_title = data.get('title')
-            logger.debug(f"Video {video_title} is vertical format at {resolution}")
-
-            # Verify that the vertical video actually has a transcript available
-            if video_id and check_captions_exist(video_id):
-                raw_date = data.get('upload_date', '')
-                formatted_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}" if len(raw_date) == 8 else datetime.today().strftime('%Y-%m-%d')
-                
-                vods.append({
-                    'title': data.get('title', 'Unknown Title'),
-                    'url': f"https://www.youtube.com/watch?v={video_id}",
-                    'date': formatted_date,
-                    'creator': data.get('uploader', 'Unknown Creator')
-                })
-            else:
-                logger.debug(f"Skipping VOD {video_id} - No captions available.")
-    return vods
-
 def fetch_latest_channel_vods(channel_input: str, date_after=None, limit: int = 50) -> list:
     url = _build_channel_url(channel_input)
     playlist_data = _fetch_playlist_data(url, date_after, limit)
 
-    vods = _filter_and_format_vods(playlist_data, url)
+    vods = process_channel_vods(playlist_data)
             
     vods.sort(key=lambda x: x['date'], reverse=True)
     logger.debug(f"Successfully scraped {len(vods)} valid VODs from {channel_input}")
