@@ -59,7 +59,8 @@ class TestYoutubeService(unittest.TestCase):
 
     @patch('services.youtube_service.check_captions_exist')
     @patch('services.youtube_service.yt_dlp.YoutubeDL')
-    def test_validate_single_vod_success(self, mock_ydl, mock_check_captions):
+    @patch('services.youtube_service.datetime')
+    def test_validate_single_vod_success(self, mock_datetime, mock_ydl, mock_check_captions):
         # Mock vertical video dimensions
         mock_instance = mock_ydl.return_value.__enter__.return_value
         mock_instance.extract_info.return_value = {'width': 1080, 'height': 1920}
@@ -67,11 +68,26 @@ class TestYoutubeService(unittest.TestCase):
         # Mock captions available
         mock_check_captions.return_value = True
 
-        test_vod = {'url': 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'}
+        # Mock datetime for today's date format
+        mock_datetime.today.return_value.strftime.return_value = '2023-10-27'
+
+        test_vod = {
+            'url': 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+            'id': 'dQw4w9WgXcQ',
+            'title': 'Test Title',
+            'upload_date': '20231026',
+            'uploader': 'Test Creator'
+        }
         result = validate_single_vod(test_vod)
 
-        # Should survive all checks and return original VOD
-        self.assertEqual(result, test_vod)
+        # Should survive all checks and return formatted dictionary
+        expected_result = {
+            'title': 'Test Title',
+            'url': 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+            'date': '2023-10-26',
+            'creator': 'Test Creator'
+        }
+        self.assertEqual(result, expected_result)
 
     @patch('services.youtube_service.yt_dlp.YoutubeDL')
     def test_validate_single_vod_horizontal(self, mock_ydl):
