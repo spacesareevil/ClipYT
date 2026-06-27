@@ -681,51 +681,89 @@ class ClipYT(ctk.CTk):
             self.after(0, self.finalize_batch_ui)
             return
 
-        for sequence_idx, (row, filename) in enumerate(pending_clips, start=1):
-            start = str(row.get("Timestamp Start", ""))
-            end = str(row.get("Timestamp End", ""))
-            
-            local_input_path = os.path.abspath(config.input_vods_dir)
-            local_staging_path = os.path.abspath(os.path.join(config.output_vods_dir, filename))
-            local_txt_path = os.path.abspath(os.path.join(config.output_vods_dir, filename.replace(".mp4", ".txt")))
-            txt_filename = filename.replace(".mp4", ".txt")
-            
-            try:
-                logger.info(f"Executing manual cut for {filename}")
-                slice_local_vod(local_input_path, start, end, local_staging_path)
-                
-                # --- AGENTIC QA INJECTION ---
-                if self.enable_qa_var.get() == "on":
-                    self.safe_update_status("Running Agentic QA Review...", "#9b59b6")
-                    review_data = self._agentic_clip_review(local_staging_path, row)
-                    if review_data:
-                        row["QA Grade"] = review_data.get("grade")
-                        row["QA Visual Description"] = review_data.get("visual_description")
-                        row["QA Is Match"] = review_data.get("is_match")
-                        row["QA Feedback"] = review_data.get("feedback")
-                        
-                        if not review_data.get("is_match"):
-                            filename = f"[QA_FAIL]_{filename}"
-                            txt_filename = f"[QA_FAIL]_{txt_filename}"
-                # ---------------------------
+        # Safely extract valid credentials
+        worker_creds = None
+        if hasattr(self, 'drive_service') and self.drive_service:
+            if hasattr(self.drive_service, '_credentials'):
+                worker_creds = self.drive_service._credentials
+            elif hasattr(self.drive_service, '_http') and hasattr(self.drive_service._http, 'credentials'):
+                worker_creds = self.drive_service._http.credentials
 
-                write_metadata_text_file(row, local_txt_path)
+        if not worker_creds and hasattr(self, 'client') and hasattr(self.client, 'auth'):
+            worker_creds = self.client.auth
+
+        def upload_and_cleanup(staging, txt, f_name, t_folder_id, t_name, credentials):
+            try:
+                # build a new service client for this thread using pre-fetched valid credentials
+                thread_drive_service = build('drive', 'v3', credentials=credentials, cache_discovery=False)
                 
-                logger.info("Uploading asset data to Drive...")
-                self.safe_update_status("Uploading to Drive...", "#3498db")
-                upload_to_google_drive(local_staging_path, filename, 'video/mp4', target_folder_id, self.drive_service)
-                upload_to_google_drive(local_txt_path, txt_filename, 'text/plain', target_folder_id, self.drive_service)
-                
-            except Exception as row_err:
-                logger.error(f"[BATCH WORKER] Task error on item {filename}: {str(row_err)}")
-                self.after(0, lambda f=filename, e=row_err: self.show_error_popup(f"Batch Exception on Item {f}:\n\n{str(e)}"))
+                upload_to_google_drive(staging, f_name, 'video/mp4', t_folder_id, thread_drive_service)
+                upload_to_google_drive(txt, t_name, 'text/plain', t_folder_id, thread_drive_service)
+            except Exception as e:
+                raise e
             finally:
-                for temp_file in (local_staging_path, local_txt_path):
+                for temp_file in (staging, txt):
                     if os.path.exists(temp_file):
                         try:
                             os.remove(temp_file)
                         except OSError as e:
                             logger.warning(f"[CLEANUP WARNING] Could not remove temp file {temp_file}: {e}")
+
+        upload_futures = []
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            for sequence_idx, (row, filename) in enumerate(pending_clips, start=1):
+                start = str(row.get("Timestamp Start", ""))
+                end = str(row.get("Timestamp End", ""))
+
+                local_input_path = os.path.abspath(config.input_vods_dir)
+                local_staging_path = os.path.abspath(os.path.join(config.output_vods_dir, filename))
+                local_txt_path = os.path.abspath(os.path.join(config.output_vods_dir, filename.replace(".mp4", ".txt")))
+                txt_filename = filename.replace(".mp4", ".txt")
+
+                try:
+                    logger.info(f"Executing manual cut for {filename}")
+                    slice_local_vod(local_input_path, start, end, local_staging_path)
+
+                    # --- AGENTIC QA INJECTION ---
+                    if self.enable_qa_var.get() == "on":
+                        self.safe_update_status("Running Agentic QA Review...", "#9b59b6")
+                        review_data = self._agentic_clip_review(local_staging_path, row)
+                        if review_data:
+                            row["QA Grade"] = review_data.get("grade")
+                            row["QA Visual Description"] = review_data.get("visual_description")
+                            row["QA Is Match"] = review_data.get("is_match")
+                            row["QA Feedback"] = review_data.get("feedback")
+
+                            if not review_data.get("is_match"):
+                                filename = f"[QA_FAIL]_{filename}"
+                                txt_filename = f"[QA_FAIL]_{txt_filename}"
+                    # ---------------------------
+
+                    write_metadata_text_file(row, local_txt_path)
+
+                    logger.info(f"Queueing upload for {filename} to Drive...")
+                    self.safe_update_status(f"Queueing {filename} upload...", "#3498db")
+                    future = executor.submit(
+                        upload_and_cleanup, local_staging_path, local_txt_path, filename, target_folder_id, txt_filename, worker_creds
+                    )
+                    upload_futures.append((future, filename))
+
+                except Exception as row_err:
+                    logger.error(f"[BATCH WORKER] Task error on item {filename}: {str(row_err)}")
+                    self.after(0, lambda f=filename, e=row_err: self.show_error_popup(f"Batch Exception on Item {f}:\n\n{str(e)}"))
+                    for temp_file in (local_staging_path, local_txt_path):
+                        if os.path.exists(temp_file):
+                            try:
+                                os.remove(temp_file)
+                            except OSError as e:
+                                logger.warning(f"[CLEANUP WARNING] Could not remove temp file {temp_file}: {e}")
+
+            for future, fname in upload_futures:
+                try:
+                    future.result()
+                except Exception as upload_err:
+                    logger.error(f"[BATCH WORKER] Upload error on item {fname}: {str(upload_err)}")
+                    self.after(0, lambda f=fname, e=upload_err: self.show_error_popup(f"Batch Upload Exception on Item {f}:\n\n{str(e)}"))
 
         self.safe_update_status("Batch Success!", "#2ecc71")
         self.after(0, self.finalize_batch_ui)
