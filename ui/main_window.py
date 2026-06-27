@@ -1,4 +1,4 @@
-import os, json, pickle, logging, hashlib, time
+import os, json, logging, hashlib, time
 import tkinter as tk
 import customtkinter as ctk
 import gspread
@@ -8,6 +8,7 @@ from dateutil.relativedelta import relativedelta
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
 from google import genai
 from google.genai import types
 
@@ -30,16 +31,19 @@ class ClipYT(ctk.CTk):
         scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = None
         if os.path.exists(config.token_cache_file):
-            with open(config.token_cache_file, 'rb') as token:
-                creds = pickle.load(token)
+            try:
+                creds = Credentials.from_authorized_user_file(config.token_cache_file, scopes)
+            except Exception as e:
+                logger.warning(f"Failed to load credentials from {config.token_cache_file}: {e}")
+                creds = None
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
             else:
                 flow = InstalledAppFlow.from_client_secrets_file(config.client_secrets_file, scopes)
                 creds = flow.run_local_server(port=0)
-            with open(config.token_cache_file, 'wb') as token:
-                pickle.dump(creds, token)
+            with open(config.token_cache_file, 'w') as token:
+                token.write(creds.to_json())
 
         self.client = gspread.authorize(creds)
         self.sheet = self.client.open(config.spreadsheet_name)
