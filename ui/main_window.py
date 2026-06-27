@@ -14,7 +14,6 @@ from google.genai import types
 from config.settings import config
 from models.clip_models import IngestionAnalysisResult, ClipReviewResult
 from utils.filenames import clean_filename, build_clip_filename
-from utils.timestamps import natural_sort_key
 from services.youtube_service import extract_youtube_id, fetch_latest_channel_vods
 from services.transcript_service import get_formatted_transcript
 from services.drive_service import get_or_create_stream_folder, get_all_filenames_in_drive_folder, upload_to_google_drive
