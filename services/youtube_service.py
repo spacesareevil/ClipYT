@@ -147,7 +147,7 @@ def _process_vod_data(data: dict) -> dict:
         logger.error(f"yt-dlp failure: {str(e)}")
         raise RuntimeError(f"yt-dlp Live Stream scanning operation failure: {str(e)}")
 
-def fetch_latest_channel_vods(channel_input: str, date_after=None, limit: int = 50) -> list:
+def _build_channel_url(channel_input: str) -> str:
     clean_input = channel_input.strip()
     if not clean_input.startswith("http"):
         if not clean_input.startswith("@"):
@@ -155,7 +155,9 @@ def fetch_latest_channel_vods(channel_input: str, date_after=None, limit: int = 
         url = f"https://www.youtube.com/{clean_input}/streams"
     else:
         url = clean_input if "/streams" in clean_input else f"{clean_input}/streams"
-    
+    return url
+
+def _fetch_playlist_data(url: str, date_after, limit: int) -> list:
     cmd = ['yt-dlp', '--flat-playlist', '--dump-json', '--no-download']
     
     # Apply the limit unless the user passed 0 (which means fetch all)
@@ -178,20 +180,31 @@ def fetch_latest_channel_vods(channel_input: str, date_after=None, limit: int = 
         logger.error(f"yt-dlp failure: {result.stderr}")
         raise RuntimeError(f"yt-dlp Live Stream scanning operation failure: {result.stderr}")
 
-    vod_lines = [line for line in result.stdout.strip().split('\n') if line]
-    vod_count = len(vod_lines)
+    playlist_data = []
+    for line in result.stdout.strip().split('\n'):
+        if line:
+            playlist_data.append(json.loads(line))
+    return playlist_data
+
+def _filter_and_format_vods(playlist_data: list, original_url: str) -> list:
+    vod_count = len(playlist_data)
     logger.debug(f"Found {vod_count} VODs. Filtering for Vertical VODs only")
     
     vods = []
-    vod_data_list = [json.loads(line) for line in vod_lines]
-
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        results = executor.map(_process_vod_data, vod_data_list)
+        results = executor.map(_process_vod_data, playlist_data)
 
         for res in results:
             if res is not None:
                 vods.append(res)
+    return vods
+
+def fetch_latest_channel_vods(channel_input: str, date_after=None, limit: int = 50) -> list:
+    url = _build_channel_url(channel_input)
+    playlist_data = _fetch_playlist_data(url, date_after, limit)
+
+    vods = _filter_and_format_vods(playlist_data, url)
             
     vods.sort(key=lambda x: x['date'], reverse=True)
-    logger.debug(f"Successfully scraped {len(vods)} valid VODs from {clean_input}")
+    logger.debug(f"Successfully scraped {len(vods)} valid VODs from {channel_input}")
     return vods

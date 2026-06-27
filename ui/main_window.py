@@ -1,4 +1,4 @@
-import os, json, pickle, logging, hashlib, time
+import os, json, logging, hashlib, time
 import tkinter as tk
 import customtkinter as ctk
 import gspread
@@ -8,13 +8,13 @@ from dateutil.relativedelta import relativedelta
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
 from google import genai
 from google.genai import types
 
 from config.settings import config
 from models.clip_models import IngestionAnalysisResult, ClipReviewResult
 from utils.filenames import clean_filename, build_clip_filename
-from utils.timestamps import natural_sort_key
 from services.youtube_service import extract_youtube_id, fetch_latest_channel_vods
 from services.transcript_service import get_formatted_transcript
 from services.drive_service import get_or_create_stream_folder, get_all_filenames_in_drive_folder, upload_to_google_drive
@@ -31,16 +31,19 @@ class ClipYT(ctk.CTk):
         scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = None
         if os.path.exists(config.token_cache_file):
-            with open(config.token_cache_file, 'rb') as token:
-                creds = pickle.load(token)
+            try:
+                creds = Credentials.from_authorized_user_file(config.token_cache_file, scopes)
+            except Exception as e:
+                logger.warning(f"Failed to load credentials from {config.token_cache_file}: {e}")
+                creds = None
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
             else:
                 flow = InstalledAppFlow.from_client_secrets_file(config.client_secrets_file, scopes)
                 creds = flow.run_local_server(port=0)
-            with open(config.token_cache_file, 'wb') as token:
-                pickle.dump(creds, token)
+            with open(config.token_cache_file, 'w') as token:
+                token.write(creds.to_json())
 
         self.client = gspread.authorize(creds)
         self.sheet = self.client.open(config.spreadsheet_name)
@@ -338,101 +341,114 @@ class ClipYT(ctk.CTk):
 
         self.refresh_worksheet_dropdowns()
 
+    def _fetch_broadcast_date(self, choice):
+        all_streams_meta = self.stream_list_tab.get_all_records()
+        for item in all_streams_meta:
+            if str(item.get("Title", "")).strip() == choice.strip():
+                self.active_broadcast_date = str(item.get("Broadcast Date", item.get("Date", ""))).strip()
+                break
+
+    def _fetch_or_create_worksheet(self, choice):
+        try:
+            target_tab = self.sheet.worksheet(choice)
+            all_values = target_tab.get_all_values()
+            if all_values:
+                self.raw_headers = all_values[0]
+                self.current_clips_data = [dict(zip(self.raw_headers, row)) for row in all_values[1:]]
+            else:
+                self.raw_headers = []
+                self.current_clips_data = []
+
+            logger.info(f"[SHEETS] Successfully mapped existing worksheet records for: '{choice}'")
+        except gspread.exceptions.WorksheetNotFound:
+            logger.warning(f"[SHEETS] Worksheet '{choice}' not found. Creating fallback placeholder tab.")
+            target_tab = self.sheet.add_worksheet(title=choice, rows="100", cols="20")
+            self.raw_headers = [
+                "Live Title", "Timestamp Start", "Timestamp End", "Clip Length (sec)",
+                "Viral Score", "On-Screen Hook", "Title", "Description", "Hashtags", "Editing Notes"
+            ]
+            target_tab.append_row(self.raw_headers)
+            self.current_clips_data = []
+            try:
+                layout_requests = {
+                    "requests": [
+                        {"setBasicFilter": {"filter": {"range": {"sheetId": target_tab.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": len(self.raw_headers)}}}},
+                        {"autoResizeDimensions": {"dimensions": {"sheetId": target_tab.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": len(self.raw_headers)}}}
+                    ]
+                }
+                self.sheet.batch_update(layout_requests)
+                logger.info(f"[SHEETS] Formatted placeholder grid for '{choice}'")
+            except Exception as f_err:
+                logger.error(f"[SHEETS WARNING] Standalone placeholder style intercept bypassed: {str(f_err)}")
+
+    def _apply_layout_preferences(self):
+        if os.path.exists(config.layout_cache_file):
+            try:
+                with open(config.layout_cache_file, "r", encoding="utf-8") as f:
+                    cached_layout = json.load(f)
+
+                cached_order = cached_layout.get("column_order", [])
+                cached_visibility = cached_layout.get("column_visibility", {})
+
+                if set(cached_order) == set(self.raw_headers):
+                    self.current_column_order = list(cached_order)
+                    self.column_visibility = cached_visibility
+                    logger.info("[LAYOUT] Successfully injected custom columns from layout config")
+                else:
+                    self.current_column_order = list(self.raw_headers)
+                    self.column_visibility = {h: True for h in self.raw_headers}
+            except Exception as cache_err:
+                logger.error(f"[LAYOUT CRITICAL] Failed parsing local preferences: {str(cache_err)}")
+                self.current_column_order = list(self.raw_headers)
+                self.column_visibility = {h: True for h in self.raw_headers}
+        else:
+            self.current_column_order = list(self.raw_headers)
+            for h in self.raw_headers:
+                if h not in self.column_visibility:
+                    self.column_visibility[h] = True
+
+    def _prepare_drive_folder(self, choice):
+        folder_key = f"{self.active_broadcast_date}_{choice}"
+        if folder_key not in self.cached_folder_ids:
+            self.cached_folder_ids[folder_key] = get_or_create_stream_folder(choice, self.active_broadcast_date, self.drive_service)
+
+        target_folder_id = self.cached_folder_ids[folder_key]
+        existing_files_cache = get_all_filenames_in_drive_folder(target_folder_id, self.drive_service)
+
+        self.current_drive_cache = existing_files_cache
+        self.current_folder_id = target_folder_id
+
+    def _update_ui_for_local_vod(self, expected_local_vod, safe_title):
+        if not os.path.exists(expected_local_vod):
+            self.source_file_exists = False
+            self.after(0, lambda: self.status_var.set(f"⚠️ Source file missing: '{safe_title}.mp4'"))
+            self.after(0, lambda: self.status_label.configure(text_color="#e74c3c"))
+            self.after(0, lambda: self.batch_btn.configure(state="disabled"))
+            self.after(0, lambda: self.check_source_btn.configure(state="normal"))
+        else:
+            self.source_file_exists = True
+            self.after(0, lambda: self.status_var.set("Status: Active VOD located locally."))
+            self.after(0, lambda: self.status_label.configure(text_color="#2ecc71"))
+            self.after(0, lambda: self.batch_btn.configure(state="normal"))
+            self.after(0, lambda: self.check_source_btn.configure(state="disabled"))
+
     def load_stream_clips(self):
         choice = self.active_choice
         if not choice: return
         try:
             self.safe_update_status(f"Fetching rows from tab '{choice}'...", "#3498db")
-            
-            all_streams_meta = self.stream_list_tab.get_all_records()
-            for item in all_streams_meta:
-                if str(item.get("Title", "")).strip() == choice.strip():
-                    self.active_broadcast_date = str(item.get("Broadcast Date", item.get("Date", ""))).strip()
-                    break
 
-            try:
-                target_tab = self.sheet.worksheet(choice)
-                all_values = target_tab.get_all_values()
-                if all_values:
-                    self.raw_headers = all_values[0]
-                    self.current_clips_data = [dict(zip(self.raw_headers, row)) for row in all_values[1:]]
-                else:
-                    self.raw_headers = []
-                    self.current_clips_data = []
-                    
-                logger.info(f"[SHEETS] Successfully mapped existing worksheet records for: '{choice}'")
-            except gspread.exceptions.WorksheetNotFound:
-                logger.warning(f"[SHEETS] Worksheet '{choice}' not found. Creating fallback placeholder tab.")
-                target_tab = self.sheet.add_worksheet(title=choice, rows="100", cols="20")
-                self.raw_headers = [
-                    "Live Title", "Timestamp Start", "Timestamp End", "Clip Length (sec)", 
-                    "Viral Score", "On-Screen Hook", "Title", "Description", "Hashtags", "Editing Notes"
-                ]
-                target_tab.append_row(self.raw_headers)
-                self.current_clips_data = [] 
-                try:
-                    layout_requests = {
-                        "requests": [
-                            {"setBasicFilter": {"filter": {"range": {"sheetId": target_tab.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": len(self.raw_headers)}}}},
-                            {"autoResizeDimensions": {"dimensions": {"sheetId": target_tab.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": len(self.raw_headers)}}}
-                        ]
-                    }
-                    self.sheet.batch_update(layout_requests)
-                    logger.info(f"[SHEETS] Formatted placeholder grid for '{choice}'")
-                except Exception as f_err:
-                    logger.error(f"[SHEETS WARNING] Standalone placeholder style intercept bypassed: {str(f_err)}")
-            
-            if os.path.exists(config.layout_cache_file):
-                try:
-                    with open(config.layout_cache_file, "r", encoding="utf-8") as f:
-                        cached_layout = json.load(f)
-                    
-                    cached_order = cached_layout.get("column_order", [])
-                    cached_visibility = cached_layout.get("column_visibility", {})
-
-                    if set(cached_order) == set(self.raw_headers):
-                        self.current_column_order = list(cached_order)
-                        self.column_visibility = cached_visibility
-                        logger.info("[LAYOUT] Successfully injected custom columns from layout config")
-                    else:
-                        self.current_column_order = list(self.raw_headers)
-                        self.column_visibility = {h: True for h in self.raw_headers}
-                except Exception as cache_err:
-                    logger.error(f"[LAYOUT CRITICAL] Failed parsing local preferences: {str(cache_err)}")
-                    self.current_column_order = list(self.raw_headers)
-                    self.column_visibility = {h: True for h in self.raw_headers}
-            else:
-                self.current_column_order = list(self.raw_headers)
-                for h in self.raw_headers:
-                    if h not in self.column_visibility:
-                        self.column_visibility[h] = True
+            self._fetch_broadcast_date(choice)
+            self._fetch_or_create_worksheet(choice)
+            self._apply_layout_preferences()
 
             safe_title = clean_filename(choice)
             expected_local_vod = os.path.join(config.input_vods_dir, f"{safe_title}.mp4")
             
-            folder_key = f"{self.active_broadcast_date}_{choice}"
-            if folder_key not in self.cached_folder_ids:
-                self.cached_folder_ids[folder_key] = get_or_create_stream_folder(choice, self.active_broadcast_date, self.drive_service)
-            
-            target_folder_id = self.cached_folder_ids[folder_key]
-            existing_files_cache = get_all_filenames_in_drive_folder(target_folder_id, self.drive_service)
-
-            if not os.path.exists(expected_local_vod):
-                self.source_file_exists = False
-                self.after(0, lambda: self.status_var.set(f"⚠️ Source file missing: '{safe_title}.mp4'"))
-                self.after(0, lambda: self.status_label.configure(text_color="#e74c3c"))
-                self.after(0, lambda: self.batch_btn.configure(state="disabled"))
-                self.after(0, lambda: self.check_source_btn.configure(state="normal"))
-            else:
-                self.source_file_exists = True
-                self.after(0, lambda: self.status_var.set("Status: Active VOD located locally."))
-                self.after(0, lambda: self.status_label.configure(text_color="#2ecc71"))
-                self.after(0, lambda: self.batch_btn.configure(state="normal"))
-                self.after(0, lambda: self.check_source_btn.configure(state="disabled"))
+            self._prepare_drive_folder(choice)
+            self._update_ui_for_local_vod(expected_local_vod, safe_title)
 
             self.current_local_vod = expected_local_vod
-            self.current_drive_cache = existing_files_cache
-            self.current_folder_id = target_folder_id
 
             self.after(0, lambda: self.layout_btn.configure(state="normal"))
             self.after(0, self.refresh_grid_view)
@@ -665,51 +681,89 @@ class ClipYT(ctk.CTk):
             self.after(0, self.finalize_batch_ui)
             return
 
-        for sequence_idx, (row, filename) in enumerate(pending_clips, start=1):
-            start = str(row.get("Timestamp Start", ""))
-            end = str(row.get("Timestamp End", ""))
-            
-            local_input_path = os.path.abspath(config.input_vods_dir)
-            local_staging_path = os.path.abspath(os.path.join(config.output_vods_dir, filename))
-            local_txt_path = os.path.abspath(os.path.join(config.output_vods_dir, filename.replace(".mp4", ".txt")))
-            txt_filename = filename.replace(".mp4", ".txt")
-            
-            try:
-                logger.info(f"Executing manual cut for {filename}")
-                slice_local_vod(local_input_path, start, end, local_staging_path)
-                
-                # --- AGENTIC QA INJECTION ---
-                if self.enable_qa_var.get() == "on":
-                    self.safe_update_status("Running Agentic QA Review...", "#9b59b6")
-                    review_data = self._agentic_clip_review(local_staging_path, row)
-                    if review_data:
-                        row["QA Grade"] = review_data.get("grade")
-                        row["QA Visual Description"] = review_data.get("visual_description")
-                        row["QA Is Match"] = review_data.get("is_match")
-                        row["QA Feedback"] = review_data.get("feedback")
-                        
-                        if not review_data.get("is_match"):
-                            filename = f"[QA_FAIL]_{filename}"
-                            txt_filename = f"[QA_FAIL]_{txt_filename}"
-                # ---------------------------
+        # Safely extract valid credentials
+        worker_creds = None
+        if hasattr(self, 'drive_service') and self.drive_service:
+            if hasattr(self.drive_service, '_credentials'):
+                worker_creds = self.drive_service._credentials
+            elif hasattr(self.drive_service, '_http') and hasattr(self.drive_service._http, 'credentials'):
+                worker_creds = self.drive_service._http.credentials
 
-                write_metadata_text_file(row, local_txt_path)
+        if not worker_creds and hasattr(self, 'client') and hasattr(self.client, 'auth'):
+            worker_creds = self.client.auth
+
+        def upload_and_cleanup(staging, txt, f_name, t_folder_id, t_name, credentials):
+            try:
+                # build a new service client for this thread using pre-fetched valid credentials
+                thread_drive_service = build('drive', 'v3', credentials=credentials, cache_discovery=False)
                 
-                logger.info("Uploading asset data to Drive...")
-                self.safe_update_status("Uploading to Drive...", "#3498db")
-                upload_to_google_drive(local_staging_path, filename, 'video/mp4', target_folder_id, self.drive_service)
-                upload_to_google_drive(local_txt_path, txt_filename, 'text/plain', target_folder_id, self.drive_service)
-                
-            except Exception as row_err:
-                logger.error(f"[BATCH WORKER] Task error on item {filename}: {str(row_err)}")
-                self.after(0, lambda f=filename, e=row_err: self.show_error_popup(f"Batch Exception on Item {f}:\n\n{str(e)}"))
+                upload_to_google_drive(staging, f_name, 'video/mp4', t_folder_id, thread_drive_service)
+                upload_to_google_drive(txt, t_name, 'text/plain', t_folder_id, thread_drive_service)
+            except Exception as e:
+                raise e
             finally:
-                for temp_file in (local_staging_path, local_txt_path):
+                for temp_file in (staging, txt):
                     if os.path.exists(temp_file):
                         try:
                             os.remove(temp_file)
                         except OSError as e:
                             logger.warning(f"[CLEANUP WARNING] Could not remove temp file {temp_file}: {e}")
+
+        upload_futures = []
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            for sequence_idx, (row, filename) in enumerate(pending_clips, start=1):
+                start = str(row.get("Timestamp Start", ""))
+                end = str(row.get("Timestamp End", ""))
+
+                local_input_path = os.path.abspath(config.input_vods_dir)
+                local_staging_path = os.path.abspath(os.path.join(config.output_vods_dir, filename))
+                local_txt_path = os.path.abspath(os.path.join(config.output_vods_dir, filename.replace(".mp4", ".txt")))
+                txt_filename = filename.replace(".mp4", ".txt")
+
+                try:
+                    logger.info(f"Executing manual cut for {filename}")
+                    slice_local_vod(local_input_path, start, end, local_staging_path)
+
+                    # --- AGENTIC QA INJECTION ---
+                    if self.enable_qa_var.get() == "on":
+                        self.safe_update_status("Running Agentic QA Review...", "#9b59b6")
+                        review_data = self._agentic_clip_review(local_staging_path, row)
+                        if review_data:
+                            row["QA Grade"] = review_data.get("grade")
+                            row["QA Visual Description"] = review_data.get("visual_description")
+                            row["QA Is Match"] = review_data.get("is_match")
+                            row["QA Feedback"] = review_data.get("feedback")
+
+                            if not review_data.get("is_match"):
+                                filename = f"[QA_FAIL]_{filename}"
+                                txt_filename = f"[QA_FAIL]_{txt_filename}"
+                    # ---------------------------
+
+                    write_metadata_text_file(row, local_txt_path)
+
+                    logger.info(f"Queueing upload for {filename} to Drive...")
+                    self.safe_update_status(f"Queueing {filename} upload...", "#3498db")
+                    future = executor.submit(
+                        upload_and_cleanup, local_staging_path, local_txt_path, filename, target_folder_id, txt_filename, worker_creds
+                    )
+                    upload_futures.append((future, filename))
+
+                except Exception as row_err:
+                    logger.error(f"[BATCH WORKER] Task error on item {filename}: {str(row_err)}")
+                    self.after(0, lambda f=filename, e=row_err: self.show_error_popup(f"Batch Exception on Item {f}:\n\n{str(e)}"))
+                    for temp_file in (local_staging_path, local_txt_path):
+                        if os.path.exists(temp_file):
+                            try:
+                                os.remove(temp_file)
+                            except OSError as e:
+                                logger.warning(f"[CLEANUP WARNING] Could not remove temp file {temp_file}: {e}")
+
+            for future, fname in upload_futures:
+                try:
+                    future.result()
+                except Exception as upload_err:
+                    logger.error(f"[BATCH WORKER] Upload error on item {fname}: {str(upload_err)}")
+                    self.after(0, lambda f=fname, e=upload_err: self.show_error_popup(f"Batch Upload Exception on Item {f}:\n\n{str(e)}"))
 
         self.safe_update_status("Batch Success!", "#2ecc71")
         self.after(0, self.finalize_batch_ui)

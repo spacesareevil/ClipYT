@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 class Settings:
     # Google OAuth Paths
     client_secrets_file: str = field(default_factory=lambda: os.getenv("YT_CLIENT_SECRETS", "client_secrets.json"))
-    token_cache_file: str = field(default_factory=lambda: os.getenv("YT_TOKEN_CACHE", "token.pickle"))
+    token_cache_file: str = field(default_factory=lambda: os.getenv("YT_TOKEN_CACHE", "token.json"))
     layout_cache_file: str = "layout_config.json"
     
     # API Keys

@@ -1,5 +1,6 @@
 import unittest
-from services.youtube_service import extract_youtube_id
+from unittest.mock import patch
+from services.youtube_service import extract_youtube_id, validate_single_vod
 
 class TestYoutubeService(unittest.TestCase):
     def test_extract_youtube_id_valid_urls(self):
@@ -43,6 +44,63 @@ class TestYoutubeService(unittest.TestCase):
                         extract_youtube_id(url)
                 else:
                     self.assertIsNone(extract_youtube_id(url))
+
+    @patch('services.youtube_service.yt_dlp.YoutubeDL')
+    def test_validate_single_vod_exception(self, mock_ydl):
+        # Mock extract_info to raise an exception
+        mock_instance = mock_ydl.return_value.__enter__.return_value
+        mock_instance.extract_info.side_effect = Exception("Mocked exception")
+
+        test_vod = {'url': 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'}
+        result = validate_single_vod(test_vod)
+
+        # Function should catch exception and return None
+        self.assertIsNone(result)
+
+    @patch('services.youtube_service.check_captions_exist')
+    @patch('services.youtube_service.yt_dlp.YoutubeDL')
+    def test_validate_single_vod_success(self, mock_ydl, mock_check_captions):
+        # Mock vertical video dimensions
+        mock_instance = mock_ydl.return_value.__enter__.return_value
+        mock_instance.extract_info.return_value = {'width': 1080, 'height': 1920}
+
+        # Mock captions available
+        mock_check_captions.return_value = True
+
+        test_vod = {'url': 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'}
+        result = validate_single_vod(test_vod)
+
+        # Should survive all checks and return original VOD
+        self.assertEqual(result, test_vod)
+
+    @patch('services.youtube_service.yt_dlp.YoutubeDL')
+    def test_validate_single_vod_horizontal(self, mock_ydl):
+        # Mock horizontal video dimensions
+        mock_instance = mock_ydl.return_value.__enter__.return_value
+        mock_instance.extract_info.return_value = {'width': 1920, 'height': 1080}
+
+        test_vod = {'url': 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'}
+        result = validate_single_vod(test_vod)
+
+        # Should discard and return None
+        self.assertIsNone(result)
+
+    @patch('services.youtube_service.check_captions_exist')
+    @patch('services.youtube_service.yt_dlp.YoutubeDL')
+    def test_validate_single_vod_no_captions(self, mock_ydl, mock_check_captions):
+        # Mock vertical video dimensions
+        mock_instance = mock_ydl.return_value.__enter__.return_value
+        mock_instance.extract_info.return_value = {'width': 1080, 'height': 1920}
+
+        # Mock captions missing
+        mock_check_captions.return_value = False
+
+        test_vod = {'url': 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'}
+        result = validate_single_vod(test_vod)
+
+        # Should discard and return None
+        self.assertIsNone(result)
+
 
 if __name__ == '__main__':
     unittest.main()
