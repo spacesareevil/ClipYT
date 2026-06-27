@@ -101,6 +101,52 @@ def check_captions_exist(video_id: str) -> bool:
         
     return False
 
+def _process_vod_data(data: dict) -> dict:
+    yt_url = data.get('url')
+    if not yt_url:
+        return None
+
+    video_id = data.get('id')
+    video_title = data.get('title')
+
+    ydl_opts = {
+        'quiet': True,
+        'simulate': True,
+        'no_warnings': True,
+        'extract_flat': False
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(yt_url, download=False)
+            width = info.get('width')
+            height = info.get('height')
+
+            if not width or not height:
+                return None
+
+            # Check for vertical aspect ratio
+            if height > width:
+                logger.debug(f"Video {video_title} is vertical format at {width}x{height}")
+
+                # Verify that the vertical video actually has a transcript available
+                if video_id and check_captions_exist(video_id):
+                    raw_date = data.get('upload_date', '')
+                    formatted_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}" if len(raw_date) == 8 else datetime.today().strftime('%Y-%m-%d')
+
+                    return {
+                        'title': data.get('title', 'Unknown Title'),
+                        'url': f"https://www.youtube.com/watch?v={video_id}",
+                        'date': formatted_date,
+                        'creator': data.get('uploader', 'Unknown Creator')
+                    }
+                else:
+                    logger.debug(f"Skipping VOD {video_id} - No captions available.")
+            return None
+    except Exception as e:
+        logger.error(f"yt-dlp failure: {str(e)}")
+        raise RuntimeError(f"yt-dlp Live Stream scanning operation failure: {str(e)}")
+
 def fetch_latest_channel_vods(channel_input: str, date_after=None, limit: int = 50) -> list:
     clean_input = channel_input.strip()
     if not clean_input.startswith("http"):
@@ -132,48 +178,19 @@ def fetch_latest_channel_vods(channel_input: str, date_after=None, limit: int = 
         logger.error(f"yt-dlp failure: {result.stderr}")
         raise RuntimeError(f"yt-dlp Live Stream scanning operation failure: {result.stderr}")
 
-    vods = []
-    vod_count = len(result.stdout.strip().split('\n'))
+    vod_lines = [line for line in result.stdout.strip().split('\n') if line]
+    vod_count = len(vod_lines)
     logger.debug(f"Found {vod_count} VODs. Filtering for Vertical VODs only")
-    for line in result.stdout.strip().split('\n'):
-        if line:
-            data = json.loads(line)     
-            yt_url = data.get('url')
-
-            format_cmd = ['yt-dlp', '--quiet', '--format', 'bv*[ext=mp4]','--print', '%(resolution)s', f"{yt_url}"]
-            try:
-                format_result = subprocess.run(format_cmd, capture_output=True, text=True, check=True)
-                resolution = format_result.stdout.strip();
-                if result.returncode != 0:
-                    logger.error(f"yt-dlp failure: {result.stderr}")
-                    raise RuntimeError(f"yt-dlp Live Stream scanning operation failure: {result.stderr}")
-
-            except subprocess.TimeoutExpired:
-                logger.error(f"yt-dlp scan timed out after 300 seconds for {url}")
-                raise RuntimeError("The YouTube channel scan timed out after 5 minutes. YouTube may be throttling the connection or the channel archive is massive. Please try again.")
     
-            width = resolution.split("x", 1)[0]
-            height = resolution.partition("x")[2]
+    vods = []
+    vod_data_list = [json.loads(line) for line in vod_lines]
 
-            # Check for vertical aspect ratio
-            if width and height and height > width:
-                video_id = data.get('id')
-                video_title = data.get('title')
-                logger.debug(f"Video {video_title} is vertical format at {resolution}")
-                
-                # Verify that the vertical video actually has a transcript available
-                if video_id and check_captions_exist(video_id):
-                    raw_date = data.get('upload_date', '')
-                    formatted_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}" if len(raw_date) == 8 else datetime.today().strftime('%Y-%m-%d')
-                    
-                    vods.append({
-                        'title': data.get('title', 'Unknown Title'),
-                        'url': f"https://www.youtube.com/watch?v={video_id}",
-                        'date': formatted_date,
-                        'creator': data.get('uploader', 'Unknown Creator')
-                    })
-                else:
-                    logger.debug(f"Skipping VOD {video_id} - No captions available.")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        results = executor.map(_process_vod_data, vod_data_list)
+
+        for res in results:
+            if res is not None:
+                vods.append(res)
             
     vods.sort(key=lambda x: x['date'], reverse=True)
     logger.debug(f"Successfully scraped {len(vods)} valid VODs from {clean_input}")
