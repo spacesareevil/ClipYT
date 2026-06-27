@@ -338,101 +338,114 @@ class ClipYT(ctk.CTk):
 
         self.refresh_worksheet_dropdowns()
 
+    def _fetch_broadcast_date(self, choice):
+        all_streams_meta = self.stream_list_tab.get_all_records()
+        for item in all_streams_meta:
+            if str(item.get("Title", "")).strip() == choice.strip():
+                self.active_broadcast_date = str(item.get("Broadcast Date", item.get("Date", ""))).strip()
+                break
+
+    def _fetch_or_create_worksheet(self, choice):
+        try:
+            target_tab = self.sheet.worksheet(choice)
+            all_values = target_tab.get_all_values()
+            if all_values:
+                self.raw_headers = all_values[0]
+                self.current_clips_data = [dict(zip(self.raw_headers, row)) for row in all_values[1:]]
+            else:
+                self.raw_headers = []
+                self.current_clips_data = []
+
+            logger.info(f"[SHEETS] Successfully mapped existing worksheet records for: '{choice}'")
+        except gspread.exceptions.WorksheetNotFound:
+            logger.warning(f"[SHEETS] Worksheet '{choice}' not found. Creating fallback placeholder tab.")
+            target_tab = self.sheet.add_worksheet(title=choice, rows="100", cols="20")
+            self.raw_headers = [
+                "Live Title", "Timestamp Start", "Timestamp End", "Clip Length (sec)",
+                "Viral Score", "On-Screen Hook", "Title", "Description", "Hashtags", "Editing Notes"
+            ]
+            target_tab.append_row(self.raw_headers)
+            self.current_clips_data = []
+            try:
+                layout_requests = {
+                    "requests": [
+                        {"setBasicFilter": {"filter": {"range": {"sheetId": target_tab.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": len(self.raw_headers)}}}},
+                        {"autoResizeDimensions": {"dimensions": {"sheetId": target_tab.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": len(self.raw_headers)}}}
+                    ]
+                }
+                self.sheet.batch_update(layout_requests)
+                logger.info(f"[SHEETS] Formatted placeholder grid for '{choice}'")
+            except Exception as f_err:
+                logger.error(f"[SHEETS WARNING] Standalone placeholder style intercept bypassed: {str(f_err)}")
+
+    def _apply_layout_preferences(self):
+        if os.path.exists(config.layout_cache_file):
+            try:
+                with open(config.layout_cache_file, "r", encoding="utf-8") as f:
+                    cached_layout = json.load(f)
+
+                cached_order = cached_layout.get("column_order", [])
+                cached_visibility = cached_layout.get("column_visibility", {})
+
+                if set(cached_order) == set(self.raw_headers):
+                    self.current_column_order = list(cached_order)
+                    self.column_visibility = cached_visibility
+                    logger.info("[LAYOUT] Successfully injected custom columns from layout config")
+                else:
+                    self.current_column_order = list(self.raw_headers)
+                    self.column_visibility = {h: True for h in self.raw_headers}
+            except Exception as cache_err:
+                logger.error(f"[LAYOUT CRITICAL] Failed parsing local preferences: {str(cache_err)}")
+                self.current_column_order = list(self.raw_headers)
+                self.column_visibility = {h: True for h in self.raw_headers}
+        else:
+            self.current_column_order = list(self.raw_headers)
+            for h in self.raw_headers:
+                if h not in self.column_visibility:
+                    self.column_visibility[h] = True
+
+    def _prepare_drive_folder(self, choice):
+        folder_key = f"{self.active_broadcast_date}_{choice}"
+        if folder_key not in self.cached_folder_ids:
+            self.cached_folder_ids[folder_key] = get_or_create_stream_folder(choice, self.active_broadcast_date, self.drive_service)
+
+        target_folder_id = self.cached_folder_ids[folder_key]
+        existing_files_cache = get_all_filenames_in_drive_folder(target_folder_id, self.drive_service)
+
+        self.current_drive_cache = existing_files_cache
+        self.current_folder_id = target_folder_id
+
+    def _update_ui_for_local_vod(self, expected_local_vod, safe_title):
+        if not os.path.exists(expected_local_vod):
+            self.source_file_exists = False
+            self.after(0, lambda: self.status_var.set(f"⚠️ Source file missing: '{safe_title}.mp4'"))
+            self.after(0, lambda: self.status_label.configure(text_color="#e74c3c"))
+            self.after(0, lambda: self.batch_btn.configure(state="disabled"))
+            self.after(0, lambda: self.check_source_btn.configure(state="normal"))
+        else:
+            self.source_file_exists = True
+            self.after(0, lambda: self.status_var.set("Status: Active VOD located locally."))
+            self.after(0, lambda: self.status_label.configure(text_color="#2ecc71"))
+            self.after(0, lambda: self.batch_btn.configure(state="normal"))
+            self.after(0, lambda: self.check_source_btn.configure(state="disabled"))
+
     def load_stream_clips(self):
         choice = self.active_choice
         if not choice: return
         try:
             self.safe_update_status(f"Fetching rows from tab '{choice}'...", "#3498db")
-            
-            all_streams_meta = self.stream_list_tab.get_all_records()
-            for item in all_streams_meta:
-                if str(item.get("Title", "")).strip() == choice.strip():
-                    self.active_broadcast_date = str(item.get("Broadcast Date", item.get("Date", ""))).strip()
-                    break
 
-            try:
-                target_tab = self.sheet.worksheet(choice)
-                all_values = target_tab.get_all_values()
-                if all_values:
-                    self.raw_headers = all_values[0]
-                    self.current_clips_data = [dict(zip(self.raw_headers, row)) for row in all_values[1:]]
-                else:
-                    self.raw_headers = []
-                    self.current_clips_data = []
-                    
-                logger.info(f"[SHEETS] Successfully mapped existing worksheet records for: '{choice}'")
-            except gspread.exceptions.WorksheetNotFound:
-                logger.warning(f"[SHEETS] Worksheet '{choice}' not found. Creating fallback placeholder tab.")
-                target_tab = self.sheet.add_worksheet(title=choice, rows="100", cols="20")
-                self.raw_headers = [
-                    "Live Title", "Timestamp Start", "Timestamp End", "Clip Length (sec)", 
-                    "Viral Score", "On-Screen Hook", "Title", "Description", "Hashtags", "Editing Notes"
-                ]
-                target_tab.append_row(self.raw_headers)
-                self.current_clips_data = [] 
-                try:
-                    layout_requests = {
-                        "requests": [
-                            {"setBasicFilter": {"filter": {"range": {"sheetId": target_tab.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": len(self.raw_headers)}}}},
-                            {"autoResizeDimensions": {"dimensions": {"sheetId": target_tab.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": len(self.raw_headers)}}}
-                        ]
-                    }
-                    self.sheet.batch_update(layout_requests)
-                    logger.info(f"[SHEETS] Formatted placeholder grid for '{choice}'")
-                except Exception as f_err:
-                    logger.error(f"[SHEETS WARNING] Standalone placeholder style intercept bypassed: {str(f_err)}")
-            
-            if os.path.exists(config.layout_cache_file):
-                try:
-                    with open(config.layout_cache_file, "r", encoding="utf-8") as f:
-                        cached_layout = json.load(f)
-                    
-                    cached_order = cached_layout.get("column_order", [])
-                    cached_visibility = cached_layout.get("column_visibility", {})
-
-                    if set(cached_order) == set(self.raw_headers):
-                        self.current_column_order = list(cached_order)
-                        self.column_visibility = cached_visibility
-                        logger.info("[LAYOUT] Successfully injected custom columns from layout config")
-                    else:
-                        self.current_column_order = list(self.raw_headers)
-                        self.column_visibility = {h: True for h in self.raw_headers}
-                except Exception as cache_err:
-                    logger.error(f"[LAYOUT CRITICAL] Failed parsing local preferences: {str(cache_err)}")
-                    self.current_column_order = list(self.raw_headers)
-                    self.column_visibility = {h: True for h in self.raw_headers}
-            else:
-                self.current_column_order = list(self.raw_headers)
-                for h in self.raw_headers:
-                    if h not in self.column_visibility:
-                        self.column_visibility[h] = True
+            self._fetch_broadcast_date(choice)
+            self._fetch_or_create_worksheet(choice)
+            self._apply_layout_preferences()
 
             safe_title = clean_filename(choice)
             expected_local_vod = os.path.join(config.input_vods_dir, f"{safe_title}.mp4")
             
-            folder_key = f"{self.active_broadcast_date}_{choice}"
-            if folder_key not in self.cached_folder_ids:
-                self.cached_folder_ids[folder_key] = get_or_create_stream_folder(choice, self.active_broadcast_date, self.drive_service)
-            
-            target_folder_id = self.cached_folder_ids[folder_key]
-            existing_files_cache = get_all_filenames_in_drive_folder(target_folder_id, self.drive_service)
-
-            if not os.path.exists(expected_local_vod):
-                self.source_file_exists = False
-                self.after(0, lambda: self.status_var.set(f"⚠️ Source file missing: '{safe_title}.mp4'"))
-                self.after(0, lambda: self.status_label.configure(text_color="#e74c3c"))
-                self.after(0, lambda: self.batch_btn.configure(state="disabled"))
-                self.after(0, lambda: self.check_source_btn.configure(state="normal"))
-            else:
-                self.source_file_exists = True
-                self.after(0, lambda: self.status_var.set("Status: Active VOD located locally."))
-                self.after(0, lambda: self.status_label.configure(text_color="#2ecc71"))
-                self.after(0, lambda: self.batch_btn.configure(state="normal"))
-                self.after(0, lambda: self.check_source_btn.configure(state="disabled"))
+            self._prepare_drive_folder(choice)
+            self._update_ui_for_local_vod(expected_local_vod, safe_title)
 
             self.current_local_vod = expected_local_vod
-            self.current_drive_cache = existing_files_cache
-            self.current_folder_id = target_folder_id
 
             self.after(0, lambda: self.layout_btn.configure(state="normal"))
             self.after(0, self.refresh_grid_view)
