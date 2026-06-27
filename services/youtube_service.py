@@ -4,7 +4,6 @@ import logging
 import subprocess
 import urllib.request
 import yt_dlp
-import concurrent.futures
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -13,62 +12,6 @@ def extract_youtube_id(url: str) -> str:
     pattern = r'(?:v=|\/shorts\/|\/embed\/|\/v\/|youtu\.be\/|\/watch\?v=|\/live\/)([a-zA-Z0-9_-]{11})'
     match = re.search(pattern, url)
     return match.group(1) if match else None
-
-def validate_single_vod(vod):
-    """
-    Worker function that executes Pass 2 and Pass 3 locally.
-    Returns the VOD if it passes both, otherwise returns None.
-    """
-    url = vod['url'] # Adjust this based on how your Pass 1 dictionaries are structured
-    
-    # 1. Native Python yt-dlp check (No subprocess overhead!)
-    ydl_opts = {
-        'quiet': True,
-        'simulate': True,
-        'no_warnings': True,
-        'extract_flat': False # We need the actual video metadata
-    }
-    
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # download=False means we are ONLY pulling metadata
-            info = ydl.extract_info(url, download=False)
-            
-            # Safely grab dimensions (defaulting to horizontal if missing)
-            width = info.get('width', 1920)
-            height = info.get('height', 1080)
-            
-            # PASS 2: Is it vertical?
-            if width >= height:
-                return None  # Discard immediately, not vertical
-                
-        # PASS 3: If it IS vertical, check captions immediately
-        # (Assuming your check_captions_exist function takes a URL)
-        if not check_captions_exist(url):
-            return None # Discard, no captions
-            
-        return vod # Success! It survived both checks.
-        
-    except Exception as e:
-        print(f"Error analyzing metadata for {url}: {e}")
-        return None
-
-def process_channel_vods(flat_playlist_vods):
-    """
-    Takes the output of Pass 1 and threads the remaining checks.
-    """
-    final_valid_vods = []
-    
-    # max_workers=5 keeps us fast without getting rate-limited by YouTube
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        # executor.map handles feeding the list to the worker function across threads
-        results = executor.map(validate_single_vod, flat_playlist_vods)
-        
-        for result in results:
-            if result is not None:
-                final_valid_vods.append(result)
-                
-    return final_valid_vods
 
 def check_captions_exist(video_id: str) -> bool:
     """
