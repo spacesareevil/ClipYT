@@ -252,8 +252,7 @@ class ClipYT(ctk.CTk):
     def _background_scrape_and_verify(self, channel, months_input, count, min_sec, max_sec):
         try:
             lookback_months = int(str(months_input).strip())
-            today_date = dt_date(2026, 6, 24)
-            start_threshold = today_date - relativedelta(months=lookback_months)
+            start_threshold = dt_date.today - relativedelta(months=lookback_months)
             
             all_scraped_vods = fetch_latest_channel_vods(channel, date_after=start_threshold, limit=0)
             target_batch = []
@@ -261,7 +260,7 @@ class ClipYT(ctk.CTk):
             for vod in all_scraped_vods:
                 try:
                     vod_date = datetime.strptime(vod['date'], '%Y-%m-%d').date()
-                    if start_threshold <= vod_date <= today_date:
+                    if start_threshold <= vod_date <= dt_date.today:
                         target_batch.append(vod)
                 except ValueError:
                     continue
