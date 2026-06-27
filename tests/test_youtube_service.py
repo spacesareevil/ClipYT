@@ -57,16 +57,12 @@ class TestYoutubeService(unittest.TestCase):
         # Function should catch exception and return None
         self.assertIsNone(result)
 
-    @patch('services.youtube_service.check_captions_exist')
     @patch('services.youtube_service.yt_dlp.YoutubeDL')
     @patch('services.youtube_service.datetime')
-    def test_validate_single_vod_success(self, mock_datetime, mock_ydl, mock_check_captions):
-        # Mock vertical video dimensions
+    def test_validate_single_vod_success(self, mock_datetime, mock_ydl):
+        # Mock vertical video dimensions and captions
         mock_instance = mock_ydl.return_value.__enter__.return_value
-        mock_instance.extract_info.return_value = {'width': 1080, 'height': 1920}
-
-        # Mock captions available
-        mock_check_captions.return_value = True
+        mock_instance.extract_info.return_value = {'width': 1080, 'height': 1920, 'subtitles': {'en': []}}
 
         # Mock datetime for today's date format
         mock_datetime.today.return_value.strftime.return_value = '2023-10-27'
@@ -101,15 +97,11 @@ class TestYoutubeService(unittest.TestCase):
         # Should discard and return None
         self.assertIsNone(result)
 
-    @patch('services.youtube_service.check_captions_exist')
     @patch('services.youtube_service.yt_dlp.YoutubeDL')
-    def test_validate_single_vod_no_captions(self, mock_ydl, mock_check_captions):
-        # Mock vertical video dimensions
+    def test_validate_single_vod_no_captions(self, mock_ydl):
+        # Mock vertical video dimensions, without subtitles/captions
         mock_instance = mock_ydl.return_value.__enter__.return_value
         mock_instance.extract_info.return_value = {'width': 1080, 'height': 1920}
-
-        # Mock captions missing
-        mock_check_captions.return_value = False
 
         test_vod = {'url': 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'}
         result = validate_single_vod(test_vod)

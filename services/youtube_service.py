@@ -42,10 +42,14 @@ def validate_single_vod(vod):
             if width >= height:
                 return None  # Discard immediately, not vertical
                 
-        # PASS 3: If it IS vertical, check captions immediately
+            # PASS 3: If it IS vertical, check captions immediately using info directly
+            has_captions = bool(info.get('subtitles')) or bool(info.get('automatic_captions'))
+            if not has_captions:
+                return None # Discard, no captions
+
         video_id = vod.get('id') or extract_youtube_id(url)
-        if not video_id or not check_captions_exist(video_id):
-            return None # Discard, no captions
+        if not video_id:
+            return None
             
         raw_date = vod.get('upload_date', '')
         formatted_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}" if raw_date and len(raw_date) == 8 else datetime.today().strftime('%Y-%m-%d')
@@ -77,37 +81,6 @@ def process_channel_vods(flat_playlist_vods):
                 final_valid_vods.append(result)
                 
     return final_valid_vods
-
-def check_captions_exist(video_id: str) -> bool:
-    """
-    Directly queries the YouTube Innertube API to check for closed captions.
-    This bypasses downloading the full HTML webpage, resulting in ~5x faster execution.
-    """
-    url = "https://www.youtube.com/youtubei/v1/player"
-    payload = json.dumps({
-        "context": {
-            "client": {
-                "clientName": "WEB",
-                "clientVersion": "2.20230301.00.00" # Standard web client version payload
-            }
-        },
-        "videoId": video_id
-    }).encode('utf-8')
-
-    req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'})
-    
-    try:
-        with urllib.request.urlopen(req, timeout=5) as response:
-            res_json = json.loads(response.read())
-            # The captions object only exists if CC/Transcripts are available
-            captions = res_json.get("captions", {})
-
-            if captions and "playerCaptionsTracklistRenderer" in captions:
-                return True
-    except Exception as e:
-        logger.warning(f"Innertube API check failed for {video_id}: {str(e)}")
-        
-    return False
 
 def _build_channel_url(channel_input: str) -> str:
     clean_input = channel_input.strip()
