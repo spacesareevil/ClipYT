@@ -1,9 +1,9 @@
 import os
-import pickle
 import logging
 import gspread
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from config.settings import config
 
@@ -25,8 +25,7 @@ class GoogleAuthService:
         logger.info("[AUTH] Initializing Google Workspace Authentication...")
         
         if os.path.exists(config.token_cache_file):
-            with open(config.token_cache_file, 'rb') as token:
-                self.creds = pickle.load(token)
+            self.creds = Credentials.from_authorized_user_file(config.token_cache_file, self.scopes)
                 
         if not self.creds or not self.creds.valid:
             if self.creds and self.creds.expired and self.creds.refresh_token:
@@ -37,8 +36,8 @@ class GoogleAuthService:
                 flow = InstalledAppFlow.from_client_secrets_file(config.client_secrets_file, self.scopes)
                 self.creds = flow.run_local_server(port=0)
                 
-            with open(config.token_cache_file, 'wb') as token:
-                pickle.dump(self.creds, token)
+            with open(config.token_cache_file, 'w') as token:
+                token.write(self.creds.to_json())
 
         # Initialize the specific clients
         self.client = gspread.authorize(self.creds)
