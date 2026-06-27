@@ -1,7 +1,39 @@
 import unittest
-from services.youtube_service import extract_youtube_id
+import urllib.error
+from unittest.mock import patch
+from services.youtube_service import extract_youtube_id, check_captions_exist
 
 class TestYoutubeService(unittest.TestCase):
+    @patch('services.youtube_service.logger')
+    @patch('urllib.request.urlopen')
+    def test_check_captions_exist_url_error(self, mock_urlopen, mock_logger):
+        # Arrange
+        mock_urlopen.side_effect = urllib.error.URLError("Network unreachable")
+        video_id = "test_video_id"
+
+        # Act
+        result = check_captions_exist(video_id)
+
+        # Assert
+        self.assertFalse(result)
+        mock_logger.warning.assert_called_once()
+        self.assertIn("Innertube API check failed", mock_logger.warning.call_args[0][0])
+
+    @patch('services.youtube_service.logger')
+    @patch('urllib.request.urlopen')
+    def test_check_captions_exist_timeout_error(self, mock_urlopen, mock_logger):
+        # Arrange
+        mock_urlopen.side_effect = TimeoutError("Connection timed out")
+        video_id = "test_video_id"
+
+        # Act
+        result = check_captions_exist(video_id)
+
+        # Assert
+        self.assertFalse(result)
+        mock_logger.warning.assert_called_once()
+        self.assertIn("Innertube API check failed", mock_logger.warning.call_args[0][0])
+
     def test_extract_youtube_id_valid_urls(self):
         valid_cases = [
             ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"),
