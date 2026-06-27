@@ -532,7 +532,7 @@ class ClipYT(ctk.CTk):
         self.channel_limit_field.insert(0, "50")
         self.channel_limit_field.grid(row=0, column=3, padx=(0, 10), pady=(15, 5), sticky="w")
 
-        self.scan_channel_btn = ctk.CTkButton(channel_frame, text="🔍 Fetch Recent Broadcast VODs", command=self.start_channel_scan_thread)
+        self.scan_channel_btn = ctk.CTkButton(channel_frame, text="🔍 Fetch Recent Live VODs", command=self.start_channel_scan_thread)
         # Anchor the button to the East edge
         self.scan_channel_btn.grid(row=0, column=4, padx=(0, 5), pady=(15, 5), sticky="e") 
 
