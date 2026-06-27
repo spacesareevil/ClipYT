@@ -223,6 +223,7 @@ __marimo__/
 
 # Extra
 *.pickle
+token.json
 client_secrets.json
 input_vods/
 yt-dlp.exe

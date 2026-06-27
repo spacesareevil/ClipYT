@@ -44,7 +44,7 @@ Because this application reads and writes data to your personal Google Sheets an
 5. Rename the downloaded file to exactly `client_secrets.json`.
 6. **Move this file into the root directory of this project.**
 
-*(Note: On your first run, a browser window will open asking you to log in and grant permissions. A `token.pickle` file will be generated automatically so you don't have to log in every time).*
+*(Note: On your first run, a browser window will open asking you to log in and grant permissions. A `token.json` file will be generated automatically so you don't have to log in every time).*
 
 ---
 
