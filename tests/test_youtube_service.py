@@ -1,5 +1,7 @@
 import unittest
-from services.youtube_service import extract_youtube_id
+import json
+from unittest.mock import patch, MagicMock
+from services.youtube_service import extract_youtube_id, check_captions_exist
 
 class TestYoutubeService(unittest.TestCase):
     def test_extract_youtube_id_valid_urls(self):
@@ -43,6 +45,44 @@ class TestYoutubeService(unittest.TestCase):
                         extract_youtube_id(url)
                 else:
                     self.assertIsNone(extract_youtube_id(url))
+
+    @patch('urllib.request.urlopen')
+    def test_check_captions_exist_true(self, mock_urlopen):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "captions": {
+                "playerCaptionsTracklistRenderer": {}
+            }
+        }).encode('utf-8')
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        self.assertTrue(check_captions_exist("dQw4w9WgXcQ"))
+
+    @patch('urllib.request.urlopen')
+    def test_check_captions_exist_empty_captions(self, mock_urlopen):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "captions": {}
+        }).encode('utf-8')
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        self.assertFalse(check_captions_exist("dQw4w9WgXcQ"))
+
+    @patch('urllib.request.urlopen')
+    def test_check_captions_exist_no_captions(self, mock_urlopen):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "some_other_key": "value"
+        }).encode('utf-8')
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        self.assertFalse(check_captions_exist("dQw4w9WgXcQ"))
+
+    @patch('urllib.request.urlopen')
+    def test_check_captions_exist_exception(self, mock_urlopen):
+        mock_urlopen.side_effect = Exception("Network error")
+
+        self.assertFalse(check_captions_exist("dQw4w9WgXcQ"))
 
 if __name__ == '__main__':
     unittest.main()
