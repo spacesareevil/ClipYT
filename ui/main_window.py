@@ -15,7 +15,7 @@ from google.genai import types
 from config.settings import config
 from models.clip_models import IngestionAnalysisResult, ClipReviewResult
 from utils.filenames import clean_filename, build_clip_filename
-from services.youtube_service import extract_youtube_id, fetch_latest_channel_vods
+from services.youtube_service import extract_youtube_id, fetch_vod_playlist, process_channel_vods
 from services.transcript_service import get_formatted_transcript
 from services.drive_service import get_or_create_stream_folder, get_all_filenames_in_drive_folder, upload_to_google_drive
 from services.clip_service import slice_local_vod, write_metadata_text_file
@@ -57,9 +57,9 @@ class ClipYT(ctk.CTk):
         self.after(0, lambda: self.status_var.set(text))
         self.after(0, lambda: self.status_label.configure(text_color=color))
 
-    def safe_update_findclip_status(self, text, color):
-        self.after(0, lambda: self.file_status_var.set(text))
-        self.after(0, lambda: self.file_status_label.configure(text_color=color))
+    def safe_update_channel_scan_status(self, text, color):
+        self.after(0, lambda: self.channel_scan_var.set(text))
+        self.after(0, lambda: self.channel_scan_label.configure(text_color=color))
 
     def safe_update_batch_status(self, text, color):
         self.after(0, lambda: self.batch_status_var.set(text))
@@ -176,24 +176,34 @@ class ClipYT(ctk.CTk):
         self.executor.submit(self.run_batch_worker)
 
     def start_channel_scan_thread(self):
+        self.safe_update_batch_status(f"Begin Fetching Recent Live VODs", "#2ecc71")
         target_channel = self.channel_input_field.get().strip()
         if not target_channel:
+            self.safe_update_batch_status(f"Error Scanning", "#e74c3c")
             self.show_error_popup("Scan Error:\n\nPlease enter a valid channel handle or profile link URL.")
             return
-            
         try:
             limit_val = int(self.channel_limit_field.get().strip())
         except ValueError:
             limit_val = 50 # Safe fallback if user typed letters
-            
+        
         self.scan_channel_btn.configure(state="disabled", text="⏳ Extracting Live VODs...")
+        
+
         self.executor.submit(self.run_channel_scan_worker, target_channel, limit_val)
         
     def run_channel_scan_worker(self, channel, limit):
         try:
-            self.scraped_vod_options = fetch_latest_channel_vods(channel, limit=limit)
-            display_titles = [f"[{v['date']}] {v['title'][:40]}..." for v in self.scraped_vod_options]
+            self.safe_update_channel_scan_status(f"Scanning {channel} for the most recent {limit} vods", "#2ecc71")
+            vod_playlist = fetch_vod_playlist(channel, limit=limit)
             
+            self.safe_update_channel_scan_status(f"Finding VODs for clipping", "#2ecc71")
+            vods = process_channel_vods(vod_playlist)
+            vods.sort(key=lambda x: x['date'], reverse=True)
+            self.safe_update_channel_scan_status(f"VODs Found, loading for display", "#2ecc71")
+            self.scraped_vod_options = vods
+            display_titles = [f"[{v['date']}] {v['title']}..." for v in self.scraped_vod_options]
+
             self.after(0, lambda: self.vod_select_dropdown.configure(values=display_titles))
             if display_titles:
                 self.after(0, lambda: self.vod_select_dropdown.set(display_titles[0]))
@@ -203,6 +213,7 @@ class ClipYT(ctk.CTk):
             else:
                 # --- NEW: Keep disabled if the channel had 0 valid VODs ---
                 self.after(0, lambda: self.run_ai_btn.configure(state="disabled"))
+            self.safe_update_channel_scan_status(f"{len(display_titles)} VODs Loaded", "#2ecc71")
                 
         except Exception as e:
             self.after(0, lambda e_val=e: self.show_error_popup(f"Scan Error:\n\n{str(e_val)}"))
@@ -223,12 +234,16 @@ class ClipYT(ctk.CTk):
         scan_bef = self.param_scan_before.get().strip()
         scan_aft = self.param_scan_after.get().strip()
 
-        if not all([title, date, poster, url, count, min_sec, max_sec, scan_bef, scan_aft]):
+        selected_idx = self.vod_select_dropdown._values.index(self.vod_select_dropdown._current_value)
+        target_vod = self.scraped_vod_options[selected_idx]
+        captions_url = target_vod["captions_url"]
+        video_id = target_vod["video_id"]
+        if not all([title, date, poster, url, count, min_sec, max_sec, scan_bef, scan_aft, captions_url]):
             self.show_error_popup("Validation Error:\n\nAll parameters must be completely filled out for single VOD ingestion.")
             return
 
         self.run_ai_btn.configure(state="disabled", text="⏳ Running Pipeline Ingestion...")
-        self.executor.submit(self.run_single_ai_ingestion, title, date, poster, url, count, min_sec, max_sec, scan_bef, scan_aft)
+        self.executor.submit(self.run_single_ai_ingestion, title, captions_url, video_id, date, poster, url, count, min_sec, max_sec, scan_bef, scan_aft)
 
     def start_batch_range_thread(self):
         channel = self.batch_channel_field.get().strip()
@@ -538,7 +553,7 @@ class ClipYT(ctk.CTk):
         # --- ROW 1: The Selection Dropdown ---
         ctk.CTkLabel(channel_frame, text="Select Target Video:", font=("Helvetica", 11, "bold")).grid(row=1, column=0, padx=15, pady=(15, 5), sticky="w")
         
-        self.vod_select_dropdown = ctk.CTkOptionMenu(channel_frame, values=["Scan channel first..."], width=450, command=self.on_vod_dropdown_selected)
+        self.vod_select_dropdown = ctk.CTkOptionMenu(channel_frame, values=["Scan channel first..."], command=self.on_vod_dropdown_selected)
         # Span the dropdown across the 3 right-most columns, and stick it to the East edge
         self.vod_select_dropdown.grid(row=1, column=1, columnspan=4, padx=5, pady=(15, 5), sticky="ew")
 
@@ -593,9 +608,9 @@ class ClipYT(ctk.CTk):
         self.run_ai_btn = ctk.CTkButton(self.find_clip_tab, text="🎬 Find clips from YouTube VOD and save to Google Sheets", fg_color="#2ecc71", hover_color="#27ae60", height=45, state="disabled", command=self.start_ai_ingestion_thread)
         self.run_ai_btn.grid(row=2, column=0, padx=20, pady=20, sticky="ew")
 
-        self._ = tk.StringVar(value="Status: Waiting for YouTube Channel Name or URL")
-        self.filestatus_label = ctk.CTkLabel(self.find_clip_tab, textvariable=self._, font=("Helvetica", 12, "italic"))
-        self.filestatus_label.grid(row=3, column=0, padx=20, pady=5, sticky="w")
+        self.channel_scan_var = tk.StringVar(value="Status: Waiting for YouTube Channel Name or URL")
+        self.channel_scan_label = ctk.CTkLabel(self.find_clip_tab, textvariable=self.channel_scan_var, font=("Helvetica", 12, "italic"))
+        self.channel_scan_label.grid(row=3, column=0, padx=20, pady=5, sticky="w")
 
     def setup_batch_range_ui(self):
         self.batch_tab.grid_columnconfigure(0, weight=1)
@@ -767,33 +782,30 @@ class ClipYT(ctk.CTk):
         self.safe_update_status("Batch Success!", "#2ecc71")
         self.after(0, self.finalize_batch_ui)
 
-    def run_single_ai_ingestion(self, title, date, poster, url, count, min_sec, max_sec, scan_bef, scan_aft):
+    def run_single_ai_ingestion(self, title, caption_url, video_id, date, poster, url, count, min_sec, max_sec, scan_bef, scan_aft):
         try:
             logger.info(f"[GEMINI PIPELINE] Initializing single pass ingestion for: '{title}'")
-            video_id = extract_youtube_id(url)
-            if not video_id:
-                raise ValueError("Could not parse a valid YouTube video ID from link.")
 
-            self.safe_update_findclip_status("Extracting stream captions...", "#3498db")
-            transcript_payload = get_formatted_transcript(video_id)
+            self.safe_update_channel_scan_status("Extracting stream captions...", "#3498db")
+            transcript_payload = get_formatted_transcript(video_id, caption_url)
 
-            self.safe_update_findclip_status("Analyzing retention with Gemini...", "#3498db")
+            self.safe_update_channel_scan_status("Analyzing retention with Gemini...", "#3498db")
             clip_rows = self._query_gemini_strategist(transcript_payload, title, poster, url, count, min_sec, max_sec, scan_bef, scan_aft)
 
             if not clip_rows:
                 raise ValueError("Gemini complete but zero clips matched parameters.")
 
-            self.safe_update_findclip_status("Syncing workspace structures...", "#e67e22")
+            self.safe_update_channel_scan_status("Syncing workspace structures...", "#e67e22")
             self._commit_clips_to_spreadsheet(title, date, url, clip_rows)
             
-            self.safe_update_findclip_status("Success! Stream ingested.", "#2ecc71")
+            self.safe_update_channel_scan_status("Success! Stream ingested.", "#2ecc71")
             self.after(0, lambda: self.new_stream_title.delete(0, tk.END))
             self.after(0, lambda: self.new_stream_url.delete(0, tk.END))
             self.after(0, self.refresh_worksheet_dropdowns)
 
         except Exception as ai_err:
             logger.error(f"[GEMINI PIPELINE CRITICAL] Ingestion failed: {str(ai_err)}")
-            self.safe_update_findclip_status("Ingestion Pipeline Crash.", "#e74c3c")
+            self.safe_update_channel_scan_status("Ingestion Pipeline Crash.", "#e74c3c")
             self.after(0, lambda e=ai_err: self.show_error_popup(f"AI Ingestion Pipeline Crash:\n\n{str(e)}"))
         finally:
             self.after(0, lambda: self.run_ai_btn.configure(state="normal", text="🎬 Find clips from YouTube VOD and save to Google Sheets"))

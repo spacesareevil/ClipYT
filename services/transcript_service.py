@@ -2,7 +2,13 @@ import os
 import re
 import json
 import logging
+import yt_dlp
+import requests
+import io
+import webvtt
+from config.settings import config
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.proxies import WebshareProxyConfig
 from config.settings import config
 
 logger = logging.getLogger(__name__)
@@ -59,22 +65,63 @@ class TranscriptService:
 
         return filtered_list
 
-    def get_formatted_transcript(self, video_id: str) -> str:
+    def get_formatted_transcript(self, video_id: str, video_url: str) -> str:
         logger.info(f"Initiating transcript extraction for Video ID: {video_id}")
         
         transcript_list = self._get_cached_transcript(video_id)
         
         if not transcript_list:
             try:
-                logger.info(f"Downloading transcript via YouTube API for Video ID: {video_id}")
-                ytt_api = YouTubeTranscriptApi()
-                transcript_list = ytt_api.fetch(video_id)
-                self._save_to_cache(video_id, transcript_list)
+                logger.info(f"Downloading transcript via YT_DLP with Video ID: {video_id}")
+                ydl_opts = {
+                    'skip_download': True,        # We only want the transcript
+                    'writeautomaticsub': True,    # Grab YouTube's auto-captions
+                    'writesubtitles': True,       # Grab manually uploaded captions (if they exist)
+                    'subtitleslangs': ['en'],
+                    'subtitlesformat': 'vtt',     # VTT contains timestamp metadata
+                    'cookiefile': 'youtube_cookies.txt', # This bypasses the rate limit
+                    'quiet': True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(video_url, download=False)
+
+                # 2. Grab the subtitle dictionaries (manual first, then auto-generated fallback)
+                manual_subs = info.get('subtitles', {})
+                auto_subs = info.get('automatic_captions', {})
+                en_subs = manual_subs.get('en') or auto_subs.get('en')
+
+                if not en_subs:
+                    return "No English subtitles found."
+
+                # 3. Find the specific URL for the .vtt format
+                # yt-dlp usually returns multiple formats (json3, ttml, vtt). We want vtt.
+                vtt_url = next((sub['url'] for sub in en_subs if sub['ext'] == 'vtt'), None)
+                
+                if not vtt_url:
+                    return "VTT format not available."
+
+                # 4. Fetch the VTT file content directly into memory
+                response = requests.get(vtt_url)
+                vtt_text = response.text
+
+                # 5. Parse the raw text string using webvtt and StringIO
+                captions = webvtt.read_buffer(io.StringIO(vtt_text))
+                
+                # 6. Structure the data for your application
+                transcript_data = []
+                for caption in captions:
+                    transcript_data.append({
+                        'start': caption.start, # Format: 'HH:MM:SS.mmm'
+                        'end': caption.end,
+                        'text': caption.text.strip().replace('\n', ' ')
+                    })
+
+                self._save_to_cache(video_id, transcript_data)
             except Exception as e:
                 logger.error(f"Transcript extraction failed for Video ID: {video_id}. Error: {str(e)}")
                 raise RuntimeError(f"Could not locate automated subtitles for video ID {video_id}. Details: {str(e)}")
 
-        dense_transcript = self._filter_by_speech_density(transcript_list)
+        dense_transcript = self._filter_by_speech_density(transcript_data)
 
         formatted_lines = []
         for entry in dense_transcript:
@@ -97,5 +144,5 @@ class TranscriptService:
 
 _transcript_service = TranscriptService()
 
-def get_formatted_transcript(video_id: str) -> str:
-    return _transcript_service.get_formatted_transcript(video_id)
+def get_formatted_transcript(video_id: str, caption_url: str) -> str:
+    return _transcript_service.get_formatted_transcript(video_id, caption_url)

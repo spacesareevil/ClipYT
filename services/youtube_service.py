@@ -6,8 +6,21 @@ import urllib.request
 import yt_dlp
 import concurrent.futures
 from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, date as dt_date
+from youtube_transcript_api import YouTubeTranscriptApi
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
+
+@dataclass
+class VerticalVodData:
+    title: str
+    url: str
+    date: dt_date
+    creator: str
+    captions_url: str
+    video_id: str
 
 def extract_youtube_id(url: str) -> str:
     pattern = r'(?:v=|\/shorts\/|\/embed\/|\/v\/|youtu\.be\/|\/watch\?v=|\/live\/)([a-zA-Z0-9_-]{11})'
@@ -15,99 +28,70 @@ def extract_youtube_id(url: str) -> str:
     return match.group(1) if match else None
 
 def validate_single_vod(vod):
-    """
-    Worker function that executes Pass 2 and Pass 3 locally.
-    Returns the VOD if it passes both, otherwise returns None.
-    """
-    url = vod['url'] # Adjust this based on how your Pass 1 dictionaries are structured
+    live_status = vod['live_status']
+    video_id = vod['id']
+    title= vod['title']    
     
-    # 1. Native Python yt-dlp check (No subprocess overhead!)
-    ydl_opts = {
-        'quiet': True,
-        'simulate': True,
-        'no_warnings': True,
-        'extract_flat': False # We need the actual video metadata
-    }
-    
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # download=False means we are ONLY pulling metadata
-            info = ydl.extract_info(url, download=False)
-            
-            # Safely grab dimensions (defaulting to horizontal if missing)
-            width = info.get('width', 1920)
-            height = info.get('height', 1080)
-            
-            # PASS 2: Is it vertical?
-            if width >= height:
-                return None  # Discard immediately, not vertical
-                
-        # PASS 3: If it IS vertical, check captions immediately
-        video_id = vod.get('id') or extract_youtube_id(url)
-        if not video_id or not check_captions_exist(video_id):
-            return None # Discard, no captions
-            
-        raw_date = vod.get('upload_date', '')
-        formatted_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}" if raw_date and len(raw_date) == 8 else datetime.today().strftime('%Y-%m-%d')
-
-        return {
-            'title': vod.get('title', 'Unknown Title'),
-            'url': f"https://www.youtube.com/watch?v={video_id}",
-            'date': formatted_date,
-            'creator': vod.get('uploader', 'Unknown Creator')
-        }
-        
-    except Exception as e:
-        print(f"Error analyzing metadata for {url}: {e}")
+    if live_status == "is_upcoming":    #Ignore Scheduled Streams
+        logger.info(f"CHECK FAILED ON {video_id}-{title[0:20]}: VOD is scheduled")
         return None
+    
+    if live_status == "post_live":      #Ignore lives that youtube has yet to process
+        logger.info(f"CHECK FAILED ON {video_id}-{title[0:20]}: VOD processing")
+        return None
+        
+    height = vod['height']
+    width = vod['width']
+
+    if height < width:                  #Ignore Horizontal Format (maybe make a toggle for horizontal/vertical?)
+        logger.info(f"CHECK FAILED ON {video_id}-{title[0:20]}: Horizontal VOD")
+        return None
+    
+    automatic_captions = vod['automatic_captions'] 
+
+    if automatic_captions is None:      #Ignore videos that do not have automatic captions
+        logger.info(f"CHECK FAILED ON {video_id}-{title[0:20]}: No captions found, uploader should check VOD copyright issues")
+        return None
+    
+    if "en" in automatic_captions:
+        en_automatic_captions = automatic_captions["en"][0]
+        if en_automatic_captions["name"] == "English":
+            en_captions_url = en_automatic_captions["url"]
+
+    raw_date = vod.get('upload_date', '')
+    formatted_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}" if raw_date and len(raw_date) == 8 else datetime.today().strftime('%Y-%m-%d')
+    logger.info(f"CHECK PASSED ON {video_id}-{title[0:20]}")
+    return VerticalVodData(
+        title = title,
+        url = vod['webpage_url'],
+        date = formatted_date,
+        creator = vod['uploader'],
+        captions_url = en_captions_url,
+        video_id=video_id
+    )
 
 def process_channel_vods(flat_playlist_vods):
     """
     Takes the output of Pass 1 and threads the remaining checks.
     """
     final_valid_vods = []
-    
     # max_workers=5 keeps us fast without getting rate-limited by YouTube
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        # executor.map handles feeding the list to the worker function across threads
-        results = executor.map(validate_single_vod, flat_playlist_vods)
-        
-        for result in results:
+        futures = [executor.submit(validate_single_vod, x) for x in flat_playlist_vods]
+
+        for future in as_completed(futures):
+            result = future.result()
             if result is not None:
-                final_valid_vods.append(result)
-                
+                 final_valid_vods.append({
+                    'title': result.title,
+                    'url': result.url,
+                    'date': result.date,
+                    'creator': result.creator,
+                    'captions_url': result.captions_url,
+                    'video_id': result.video_id
+                 })
+    logger.info(f"Returning {len(final_valid_vods)} VODs");               
     return final_valid_vods
-
-def check_captions_exist(video_id: str) -> bool:
-    """
-    Directly queries the YouTube Innertube API to check for closed captions.
-    This bypasses downloading the full HTML webpage, resulting in ~5x faster execution.
-    """
-    url = "https://www.youtube.com/youtubei/v1/player"
-    payload = json.dumps({
-        "context": {
-            "client": {
-                "clientName": "WEB",
-                "clientVersion": "2.20230301.00.00" # Standard web client version payload
-            }
-        },
-        "videoId": video_id
-    }).encode('utf-8')
-
-    req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'})
-    
-    try:
-        with urllib.request.urlopen(req, timeout=5) as response:
-            res_json = json.loads(response.read())
-            # The captions object only exists if CC/Transcripts are available
-            captions = res_json.get("captions", {})
-
-            if captions and "playerCaptionsTracklistRenderer" in captions:
-                return True
-    except Exception as e:
-        logger.warning(f"Innertube API check failed for {video_id}: {str(e)}")
-        
-    return False
 
 def _build_channel_url(channel_input: str) -> str:
     clean_input = channel_input.strip()
@@ -120,7 +104,7 @@ def _build_channel_url(channel_input: str) -> str:
     return url
 
 def _fetch_playlist_data(url: str, date_after, limit: int) -> list:
-    cmd = ['yt-dlp', '--flat-playlist', '--dump-json', '--no-download']
+    cmd = ['yt-dlp', '--dump-json', '--no-download', '--ignore-no-formats-error']
     
     # Apply the limit unless the user passed 0 (which means fetch all)
     if limit > 0:
@@ -131,7 +115,6 @@ def _fetch_playlist_data(url: str, date_after, limit: int) -> list:
         cmd.extend(['--dateafter', date_str])
         
     cmd.append(url)
-    
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=300)
     except subprocess.TimeoutExpired:
@@ -148,12 +131,8 @@ def _fetch_playlist_data(url: str, date_after, limit: int) -> list:
             playlist_data.append(json.loads(line))
     return playlist_data
 
-def fetch_latest_channel_vods(channel_input: str, date_after=None, limit: int = 50) -> list:
+def fetch_vod_playlist(channel_input: str, date_after=None, limit: int = 50) -> list:
+    logger.info(f"Fetching {limit} VODs from Channel {channel_input}");
     url = _build_channel_url(channel_input)
-    playlist_data = _fetch_playlist_data(url, date_after, limit)
-
-    vods = process_channel_vods(playlist_data)
-            
-    vods.sort(key=lambda x: x['date'], reverse=True)
-    logger.debug(f"Successfully scraped {len(vods)} valid VODs from {channel_input}")
-    return vods
+    vod_playlist = _fetch_playlist_data(url, date_after, limit)
+    return vod_playlist

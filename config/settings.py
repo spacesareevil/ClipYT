@@ -1,10 +1,12 @@
 import os
 import sys
 import logging
+from dotenv import load_dotenv
 from dataclasses import dataclass, field
 
 @dataclass
 class Settings:
+    load_dotenv()
     # Google OAuth Paths
     client_secrets_file: str = field(default_factory=lambda: os.getenv("YT_CLIENT_SECRETS", "client_secrets.json"))
     token_cache_file: str = field(default_factory=lambda: os.getenv("YT_TOKEN_CACHE", "token.json"))
@@ -13,9 +15,13 @@ class Settings:
     # API Keys
     gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY"))
 
+    # Webshare Proxy
+    webshare_proxy_username: str = field(default_factory=lambda: os.getenv("WEBSHARE_PROXY_USERNAME"))
+    webshare_proxy_password: str = field(default_factory=lambda: os.getenv("WEBSHARE_PROXY_PASSWORD"))
+
     # Google Workspace Targets
-    spreadsheet_name: str = "YouTube Live Stream Clips"
     master_drive_folder_id: str = "1G9UwjtRUlkdFbiYY1x-i7qStoc4vSFKy"
+    spreadsheet_name: str = "YouTube Live Stream Clips"
 
     # Local Directory Paths
     input_vods_dir: str = "./input_vods"

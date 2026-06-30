@@ -5,13 +5,13 @@ def setup_logging():
     # Set the root logger to INFO to prevent third-party noise
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        format='%(asctime)s [%(levelname)s]\t%(name)s\t%(message)s',
         handlers=[logging.StreamHandler(sys.stdout)]
     )
 
     # Create a verbose formatter for our specific loggers
     verbose_formatter = logging.Formatter(
-        '%(asctime)s [%(levelname)s] %(name)s (%(filename)s:%(lineno)d - %(funcName)s): %(message)s'
+        '%(asctime)s [%(levelname)s]\t%(name)s\t%(message)s\t (%(filename)s:%(lineno)d - %(funcName)s)'
     )
 
     # Create a console handler with the verbose formatter
