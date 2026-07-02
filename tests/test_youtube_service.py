@@ -75,7 +75,7 @@ class TestYoutubeService(unittest.TestCase):
             'width': 1080,
             'height': 1920,
             'automatic_captions': {
-                'en': [{'name': 'English', 'url': 'http://example.com/vtt'}]
+                'en': [{'name': 'English', 'ext': 'vtt', 'url': 'http://example.com/vtt'}]
             },
             'webpage_url': 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
             'uploader': 'Test Creator',

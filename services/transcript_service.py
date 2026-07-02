@@ -2,13 +2,11 @@ import os
 import re
 import json
 import logging
+import difflib
 import yt_dlp
 import requests
 import io
 import webvtt
-from config.settings import config
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api.proxies import WebshareProxyConfig
 from config.settings import config
 
 logger = logging.getLogger(__name__)
@@ -32,8 +30,32 @@ class TranscriptService:
 
     def _clean_text(self, text: str) -> str:
         text = text.replace('\n', ' ').strip()
+        text = re.sub(r'<[^>]*>', '', text)
         text = re.sub(r'\s+', ' ', text)
         return text
+
+    def _deduplicate_rolling_text(self, text1: str, text2: str) -> str:
+        # Split texts into words
+        words1 = text1.split()
+        words2 = text2.split()
+
+        # If either is empty, return the other
+        if not words1:
+            return text2
+        if not words2:
+            return ""
+
+        matcher = difflib.SequenceMatcher(None, words1, words2)
+        match = matcher.find_longest_match(0, len(words1), 0, len(words2))
+
+        if match.size > 0 and match.b == 0 and match.a + match.size == len(words1):
+            return " ".join(words2[match.size:])
+
+        # Also try exact prefix match if fuzzy fails
+        if text2.startswith(text1):
+            return text2[len(text1):].strip()
+
+        return text2
 
     def _filter_by_speech_density(self, transcript_list: list, chunk_sec: int = 300, min_words: int = 50) -> list:
         if not transcript_list: 
@@ -65,56 +87,38 @@ class TranscriptService:
 
         return filtered_list
 
-    def get_formatted_transcript(self, video_id: str, video_url: str) -> str:
+    def get_formatted_transcript(self, video_id: str, captions_url: str) -> str:
         logger.info(f"Initiating transcript extraction for Video ID: {video_id}")
         
-        transcript_list = self._get_cached_transcript(video_id)
+        transcript_data = self._get_cached_transcript(video_id)
         
-        if not transcript_list:
+        if not transcript_data:
+            if not captions_url:
+                logger.error(f"Transcript extraction failed for Video ID: {video_id}. Error: captions_url not provided")
+                raise RuntimeError(f"Could not locate automated subtitles for video ID {video_id}. Details: captions_url not provided")
             try:
-                logger.info(f"Downloading transcript via YT_DLP with Video ID: {video_id}")
-                ydl_opts = {
-                    'skip_download': True,        # We only want the transcript
-                    'writeautomaticsub': True,    # Grab YouTube's auto-captions
-                    'writesubtitles': True,       # Grab manually uploaded captions (if they exist)
-                    'subtitleslangs': ['en'],
-                    'subtitlesformat': 'vtt',     # VTT contains timestamp metadata
-                    'cookiefile': 'youtube_cookies.txt', # This bypasses the rate limit
-                    'quiet': True,
-                }
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(video_url, download=False)
+                logger.info(f"Downloading transcript via VTT URL with Video ID: {video_id}")
 
-                # 2. Grab the subtitle dictionaries (manual first, then auto-generated fallback)
-                manual_subs = info.get('subtitles', {})
-                auto_subs = info.get('automatic_captions', {})
-                en_subs = manual_subs.get('en') or auto_subs.get('en')
-
-                if not en_subs:
-                    return "No English subtitles found."
-
-                # 3. Find the specific URL for the .vtt format
-                # yt-dlp usually returns multiple formats (json3, ttml, vtt). We want vtt.
-                vtt_url = next((sub['url'] for sub in en_subs if sub['ext'] == 'vtt'), None)
-                
-                if not vtt_url:
-                    return "VTT format not available."
-
-                # 4. Fetch the VTT file content directly into memory
-                response = requests.get(vtt_url)
+                # Fetch the VTT file content directly into memory
+                response = requests.get(captions_url)
                 vtt_text = response.text
 
-                # 5. Parse the raw text string using webvtt and StringIO
+                # Parse the raw text string using webvtt and StringIO
                 captions = webvtt.read_buffer(io.StringIO(vtt_text))
                 
-                # 6. Structure the data for your application
+                # Structure the data and deduplicate rolling text
                 transcript_data = []
+                previous_text = ""
                 for caption in captions:
-                    transcript_data.append({
-                        'start': caption.start, # Format: 'HH:MM:SS.mmm'
-                        'end': caption.end,
-                        'text': caption.text.strip().replace('\n', ' ')
-                    })
+                    clean_text = self._clean_text(caption.text)
+                    deduped_text = self._deduplicate_rolling_text(previous_text, clean_text)
+                    if deduped_text:
+                        transcript_data.append({
+                            'start': caption.start_in_seconds,
+                            'end': caption.end_in_seconds,
+                            'text': deduped_text
+                        })
+                    previous_text = clean_text
 
                 self._save_to_cache(video_id, transcript_data)
             except Exception as e:

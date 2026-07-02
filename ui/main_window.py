@@ -251,8 +251,10 @@ class ClipYT(ctk.CTk):
         count = self.batch_clip_count.get().strip()
         min_sec = self.batch_min_sec.get().strip()
         max_sec = self.batch_max_sec.get().strip()
+        scan_bef = self.batch_scan_before.get().strip()
+        scan_aft = self.batch_scan_after.get().strip()
 
-        if not all([channel, months_input, count, min_sec, max_sec]):
+        if not all([channel, months_input, count, min_sec, max_sec, scan_bef, scan_aft]):
             self.show_error_popup("Validation Error:\n\nPlease specify all timeline automation entries completely.")
             return
 
@@ -262,20 +264,21 @@ class ClipYT(ctk.CTk):
         self.batch_progress_bar.grid()
         self.batch_progress_bar.start()
 
-        self.executor.submit(self._background_scrape_and_verify, channel, months_input, count, min_sec, max_sec)
+        self.executor.submit(self._background_scrape_and_verify, channel, months_input, count, min_sec, max_sec, scan_bef, scan_aft)
 
-    def _background_scrape_and_verify(self, channel, months_input, count, min_sec, max_sec):
+    def _background_scrape_and_verify(self, channel, months_input, count, min_sec, max_sec, scan_bef, scan_aft):
         try:
             lookback_months = int(str(months_input).strip())
-            start_threshold = dt_date.today - relativedelta(months=lookback_months)
+            start_threshold = dt_date.today() - relativedelta(months=lookback_months)
             
-            all_scraped_vods = fetch_latest_channel_vods(channel, date_after=start_threshold, limit=0)
+            vod_playlist = fetch_vod_playlist(channel, date_after=start_threshold, limit=0)
+            all_scraped_vods = process_channel_vods(vod_playlist)
             target_batch = []
             
             for vod in all_scraped_vods:
                 try:
                     vod_date = datetime.strptime(vod['date'], '%Y-%m-%d').date()
-                    if start_threshold <= vod_date <= dt_date.today:
+                    if start_threshold <= vod_date <= dt_date.today():
                         target_batch.append(vod)
                 except ValueError:
                     continue
@@ -292,7 +295,7 @@ class ClipYT(ctk.CTk):
                 discovered_streams=target_batch,
                 existing_titles=self.stream_titles,
                 on_confirm_callback=lambda verified_streams: self.execute_verified_batch_processing(
-                    verified_streams, count, min_sec, max_sec
+                    verified_streams, count, min_sec, max_sec, scan_bef, scan_aft
                 )
             ))
         except Exception as e:
@@ -301,13 +304,13 @@ class ClipYT(ctk.CTk):
             self.after(0, lambda err=e: self.show_error_popup(f"Scrape Error:\n\n{str(err)}"))
             self.after(0, self.finalize_batch_ui)
 
-    def execute_verified_batch_processing(self, verified_streams, count, min_sec, max_sec):
+    def execute_verified_batch_processing(self, verified_streams, count, min_sec, max_sec, scan_bef, scan_aft):
         if not verified_streams:
             self.finalize_batch_ui()
             return
             
         self.run_batch_range_btn.configure(state="disabled", text="⚙️ Running Batch Automation...")
-        self.executor.submit(self.run_batch_range_ingestion, verified_streams, count, min_sec, max_sec)
+        self.executor.submit(self.run_batch_range_ingestion, verified_streams, count, min_sec, max_sec, scan_bef, scan_aft)
 
     def start_single_clip_pipeline(self, local_vod_path, row, filename, target_folder_id):
         self.safe_update_status("Running single processing task...", "#3498db")
@@ -653,15 +656,27 @@ class ClipYT(ctk.CTk):
         self.batch_max_sec.insert(0, "180")
         self.batch_max_sec.pack(side="left")
 
+        ctk.CTkLabel(config_frame, text="Context Window Scan (Sec):", font=("Helvetica", 11, "bold")).grid(row=2, column=0, padx=15, pady=10, sticky="e")
+        scan_bounds_frame = ctk.CTkFrame(config_frame, fg_color="transparent")
+        scan_bounds_frame.grid(row=2, column=1, sticky="w")
+
+        self.batch_scan_before = ctk.CTkEntry(scan_bounds_frame, width=50)
+        self.batch_scan_before.insert(0, "60")
+        self.batch_scan_before.pack(side="left")
+        ctk.CTkLabel(scan_bounds_frame, text=" Before / After ").pack(side="left", padx=5)
+        self.batch_scan_after = ctk.CTkEntry(scan_bounds_frame, width=50)
+        self.batch_scan_after.insert(0, "60")
+        self.batch_scan_after.pack(side="left")
+
         self.run_batch_range_btn = ctk.CTkButton(self.batch_tab, text="🚀 Find & Make All Clips", fg_color="#3498db", hover_color="#2980b9", height=45, command=self.start_batch_range_thread)
-        self.run_batch_range_btn.grid(row=2, column=0, padx=20, pady=25, sticky="ew")
+        self.run_batch_range_btn.grid(row=3, column=0, columnspan=4, padx=20, pady=25, sticky="ew")
 
         self.batch_status_var = tk.StringVar(value="Batch Status: System idle. Ready to query timeline ranges.")
         self.batch_status_label = ctk.CTkLabel(self.batch_tab, textvariable=self.batch_status_var, font=("Helvetica", 12, "italic"))
-        self.batch_status_label.grid(row=3, column=0, padx=20, pady=5, sticky="w")
+        self.batch_status_label.grid(row=4, column=0, padx=20, pady=5, sticky="w")
 
         self.batch_progress_bar = ctk.CTkProgressBar(self.batch_tab, mode="indeterminate", width=300)
-        self.batch_progress_bar.grid(row=4, column=0, padx=20, pady=5, sticky="w")
+        self.batch_progress_bar.grid(row=5, column=0, padx=20, pady=5, sticky="w")
         self.batch_progress_bar.set(0)
         self.batch_progress_bar.grid_remove() 
 
@@ -810,7 +825,7 @@ class ClipYT(ctk.CTk):
         finally:
             self.after(0, lambda: self.run_ai_btn.configure(state="normal", text="🎬 Find clips from YouTube VOD and save to Google Sheets"))
 
-    def run_batch_range_ingestion(self, verified_batch, count, min_sec, max_sec):
+    def run_batch_range_ingestion(self, verified_batch, count, min_sec, max_sec, scan_bef, scan_aft):
         try:
             total_batch_count = len(verified_batch)
             logger.info(f"[BATCH PIPELINE] Processing {total_batch_count} verified long-form vertical assets.")
@@ -820,6 +835,7 @@ class ClipYT(ctk.CTk):
                 vod_date_str = current_vod['date']
                 vod_url = current_vod['url']
                 vod_creator = current_vod['creator']
+                captions_url = current_vod.get('captions_url')
                 
                 if vod_title in self.stream_titles:
                     logger.info(f"[BATCH PIPELINE] Skipping '{vod_title}' — already exists in Stream List.")
@@ -833,13 +849,13 @@ class ClipYT(ctk.CTk):
                 if not video_id: continue
 
                 try:
-                    transcript_payload = get_formatted_transcript(video_id)
+                    transcript_payload = get_formatted_transcript(video_id, captions_url)
                 except Exception as tx_err:
                     logger.error(f"[BATCH PIPELINE] Skipping VOD '{vod_title}' — Subtitle tracks not found: {str(tx_err)}")
                     continue
 
                 self.safe_update_batch_status(f"Batch Ingest [{batch_idx}/{total_batch_count}]: Running Gemini analysis...", "#3498db")
-                clip_rows = self._query_gemini_strategist(transcript_payload, vod_title, vod_creator, vod_url, count, min_sec, max_sec, "60", "60")
+                clip_rows = self._query_gemini_strategist(transcript_payload, vod_title, vod_creator, vod_url, count, min_sec, max_sec, scan_bef, scan_aft)
 
                 if not clip_rows:
                     logger.warning(f"[BATCH PIPELINE] No matching high-retention highlights isolated for stream: {vod_title}")
