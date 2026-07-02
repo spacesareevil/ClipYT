@@ -8,7 +8,6 @@ import concurrent.futures
 from datetime import datetime
 from dataclasses import dataclass
 from datetime import datetime, date as dt_date
-from youtube_transcript_api import YouTubeTranscriptApi
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
@@ -47,16 +46,28 @@ def validate_single_vod(vod):
         logger.info(f"CHECK FAILED ON {video_id}-{title[0:20]}: Horizontal VOD")
         return None
     
-    automatic_captions = vod['automatic_captions'] 
+    automatic_captions = vod.get('automatic_captions')
+    subtitles = vod.get('subtitles')
 
-    if automatic_captions is None:      #Ignore videos that do not have automatic captions
-        logger.info(f"CHECK FAILED ON {video_id}-{title[0:20]}: No captions found, uploader should check VOD copyright issues")
-        return None
+    en_captions_url = None
     
-    if "en" in automatic_captions:
-        en_automatic_captions = automatic_captions["en"][0]
-        if en_automatic_captions["name"] == "English":
-            en_captions_url = en_automatic_captions["url"]
+    # Try manual English subtitles first
+    if subtitles and "en" in subtitles:
+        for sub in subtitles["en"]:
+            if sub.get("ext") == "vtt":
+                en_captions_url = sub.get("url")
+                break
+
+    # Fallback to automatic English captions
+    if not en_captions_url and automatic_captions and "en" in automatic_captions:
+        for sub in automatic_captions["en"]:
+            if sub.get("ext") == "vtt":
+                en_captions_url = sub.get("url")
+                break
+
+    if not en_captions_url:
+        logger.info(f"CHECK FAILED ON {video_id}-{title[0:20]}: No English VTT captions found")
+        return None
 
     raw_date = vod.get('upload_date', '')
     formatted_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}" if raw_date and len(raw_date) == 8 else datetime.today().strftime('%Y-%m-%d')
