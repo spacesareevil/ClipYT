@@ -84,7 +84,18 @@ class ClipDataGrid(ctk.CTkScrollableFrame):
 
             # Column 3: Status
             status_text = str(clip.get('status', 'Pending'))
-            status_color = "#2ecc71" if status_text.lower() == "complete" else ("#f1c40f" if status_text.lower() == "processing" else "#ecf0f1")
+
+            if status_text.lower() == "complete":
+                status_color = "#2ecc71"
+            elif status_text.lower() == "processing":
+                status_color = "#f1c40f"
+            elif "needs reslicing" in status_text.lower():
+                status_color = "#e67e22" # Orange color for attention
+            elif status_text.lower() == "in drive":
+                status_color = "#3498db"
+            else:
+                status_color = "#ecf0f1"
+
             status_lbl = ctk.CTkLabel(self, text=status_text, text_color=status_color)
             status_lbl.grid(row=row_idx, column=3, padx=10, pady=4, sticky="w")
             self.grid_widgets.append(status_lbl)
