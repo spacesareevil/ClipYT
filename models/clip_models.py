@@ -20,3 +20,5 @@ class ClipReviewResult(BaseModel):
     visual_description: str
     is_match: bool
     feedback: str
+    new_start_time: str | None = None
+    new_end_time: str | None = None

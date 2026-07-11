@@ -19,6 +19,7 @@ from services.youtube_service import extract_youtube_id, fetch_vod_playlist, pro
 from services.transcript_service import get_formatted_transcript
 from services.drive_service import get_or_create_stream_folder, get_all_filenames_in_drive_folder, upload_to_google_drive
 from services.clip_service import slice_local_vod, write_metadata_text_file
+from services.validation_service import agentic_clip_review, delete_cached_file, purge_expired_cache
 from ui.components.clip_data_grid import ClipDataGrid
 from ui.error_popup_window import ErrorPopupWindow
 from ui.layout_manager_window import LayoutManagerWindow
@@ -119,35 +120,32 @@ class ClipYT(ctk.CTk):
 
     def refresh_grid_view(self):
         """Prepares the drive cache data and passes it to the grid component."""
-        if not hasattr(self, 'current_drive_cache') or not self.current_drive_cache:
+        if not hasattr(self, 'current_clips_data') or not self.current_clips_data:
             self.clip_grid.render_data_grid([])
             return
 
         formatted_data = []
         
-        # Scenario A: The cache is a dictionary (e.g., {'Video Title': 'DriveID'})
-        if isinstance(self.current_drive_cache, dict):
-            for title in self.current_drive_cache.keys():
-                formatted_data.append({
-                    'title': title, 
-                    'start_time': '--:--', 
-                    'end_time': '--:--', 
-                    'status': 'In Drive'
-                })
+        for row in self.current_clips_data:
+            title = row.get("Title", "Untitled")
+            start = row.get("Timestamp Start", "--:--")
+            end = row.get("Timestamp End", "--:--")
+            filename = build_clip_filename(row, self.active_choice)
+
+            status = 'Pending'
+            if filename in self.current_drive_cache:
+                status = 'In Drive'
+            elif "New Timestamp Start" in row and row["New Timestamp Start"]:
+                status = 'Needs Reslicing (New Timestamps)'
+                start = row["New Timestamp Start"]
+                end = row["New Timestamp End"]
                 
-        # Scenario B: The cache is a list of strings (e.g., ['Video 1', 'Video 2'])
-        elif isinstance(self.current_drive_cache, list) and len(self.current_drive_cache) > 0 and isinstance(self.current_drive_cache[0], str):
-            for title in self.current_drive_cache:
-                formatted_data.append({
-                    'title': title, 
-                    'start_time': '--:--', 
-                    'end_time': '--:--', 
-                    'status': 'In Drive'
-                })
-                
-        # Scenario C: It is already a list of dictionaries
-        else:
-            formatted_data = self.current_drive_cache
+            formatted_data.append({
+                'title': title,
+                'start_time': start,
+                'end_time': end,
+                'status': status
+            })
             
         # Send the properly packaged data to the grid!
         self.clip_grid.render_data_grid(formatted_data)
@@ -355,6 +353,9 @@ class ClipYT(ctk.CTk):
 
         self.connect_to_google()
         self.ai_client = genai.Client(api_key=config.gemini_api_key)
+
+        # Purge any expired file cache entries
+        purge_expired_cache(self.ai_client)
 
         self.refresh_worksheet_dropdowns()
 
@@ -700,6 +701,7 @@ class ClipYT(ctk.CTk):
             
             filename = build_clip_filename(row, self.active_choice)
             if filename not in existing_files:
+                # Always re-append pending rows, whether they are fresh or need reslicing
                 pending_clips.append((row, filename))
 
         total_count = len(pending_clips)
@@ -741,41 +743,78 @@ class ClipYT(ctk.CTk):
         upload_futures = []
         with ThreadPoolExecutor(max_workers=5) as executor:
             for sequence_idx, (row, filename) in enumerate(pending_clips, start=1):
-                start = str(row.get("Timestamp Start", ""))
-                end = str(row.get("Timestamp End", ""))
+                needs_reslice = "New Timestamp Start" in row and row["New Timestamp Start"]
 
-                local_input_path = os.path.abspath(config.input_vods_dir)
+                # If it already failed and has new timestamps, use them for the final slice
+                start = row.get("New Timestamp Start") if needs_reslice else str(row.get("Timestamp Start", ""))
+                end = row.get("New Timestamp End") if needs_reslice else str(row.get("Timestamp End", ""))
+
+                local_input_path = expected_local_vod # Ensure we use the full path to the video file
                 local_staging_path = os.path.abspath(os.path.join(config.output_vods_dir, filename))
                 local_txt_path = os.path.abspath(os.path.join(config.output_vods_dir, filename.replace(".mp4", ".txt")))
                 txt_filename = filename.replace(".mp4", ".txt")
 
                 try:
-                    logger.info(f"Executing manual cut for {filename}")
+                    logger.info(f"Executing manual cut for {filename} using {start} - {end}")
                     slice_local_vod(local_input_path, start, end, local_staging_path)
 
+                    skip_upload = False
+
                     # --- AGENTIC QA INJECTION ---
-                    if self.enable_qa_var.get() == "on":
+                    if self.enable_qa_var.get() == "on" and not needs_reslice:
                         self.safe_update_status("Running Agentic QA Review...", "#9b59b6")
-                        review_data = self._agentic_clip_review(local_staging_path, row)
+                        review_data = agentic_clip_review(self.ai_client, local_staging_path, local_input_path, row)
                         if review_data:
                             row["QA Grade"] = review_data.get("grade")
                             row["QA Visual Description"] = review_data.get("visual_description")
                             row["QA Is Match"] = review_data.get("is_match")
                             row["QA Feedback"] = review_data.get("feedback")
 
-                            if not review_data.get("is_match"):
+                            new_start = review_data.get("new_start_time")
+                            new_end = review_data.get("new_end_time")
+
+                            # If it failed match OR gave new timestamps, we mark it for reslice and DON'T upload yet
+                            if not review_data.get("is_match") or (new_start and new_end):
+                                logger.info(f"Clip {filename} needs reslicing based on QA review.")
+                                skip_upload = True
+
+                                if new_start and new_end:
+                                    row["New Timestamp Start"] = new_start
+                                    row["New Timestamp End"] = new_end
+
                                 filename = f"[QA_FAIL]_{filename}"
                                 txt_filename = f"[QA_FAIL]_{txt_filename}"
+
+                                # Immediately refresh the grid to show "Needs Reslicing" status
+                                self.after(0, self.refresh_grid_view)
                     # ---------------------------
+
+                    # If this was a reslice pass, we clean up the cached Gemini file
+                    if needs_reslice:
+                        delete_cached_file(self.ai_client, expected_local_vod, str(row.get("Timestamp Start", "")), str(row.get("Timestamp End", "")))
+                        # Clear new timestamps so it shows as 'In Drive' on next refresh
+                        row["New Timestamp Start"] = ""
+                        row["New Timestamp End"] = ""
 
                     write_metadata_text_file(row, local_txt_path)
 
-                    logger.info(f"Queueing upload for {filename} to Drive...")
-                    self.safe_update_status(f"Queueing {filename} upload...", "#3498db")
-                    future = executor.submit(
-                        upload_and_cleanup, local_staging_path, local_txt_path, filename, target_folder_id, txt_filename, worker_creds
-                    )
-                    upload_futures.append((future, filename))
+                    if not skip_upload:
+                        logger.info(f"Queueing upload for {filename} to Drive...")
+                        self.safe_update_status(f"Queueing {filename} upload...", "#3498db")
+                        future = executor.submit(
+                            upload_and_cleanup, local_staging_path, local_txt_path, filename, target_folder_id, txt_filename, worker_creds
+                        )
+                        upload_futures.append((future, filename))
+                    else:
+                        logger.info(f"Skipping upload for {filename} pending user reslice trigger. Purging local chunk.")
+                        self.safe_update_status(f"Clip needs reslice. Upload delayed.", "#f39c12")
+                        # Explicitly purge the local chunks if upload is skipped to save disk space
+                        for temp_file in (local_staging_path, local_txt_path):
+                            if os.path.exists(temp_file):
+                                try:
+                                    os.remove(temp_file)
+                                except OSError as e:
+                                    logger.warning(f"[CLEANUP WARNING] Could not remove temp file {temp_file}: {e}")
 
                 except Exception as row_err:
                     logger.error(f"[BATCH WORKER] Task error on item {filename}: {str(row_err)}")
@@ -938,62 +977,6 @@ class ClipYT(ctk.CTk):
 
         return extracted_clips
 
-    def _agentic_clip_review(self, local_staging_path, row):
-        title = row.get("Title", "")
-        desc = row.get("Description", "")
-        notes = row.get("Editing Notes", "")
-        
-        logger.info(f"[QA REVIEW] Uploading {local_staging_path} to Gemini for visual analysis...")
-        video_file = self.ai_client.files.upload(file=local_staging_path)
-        
-        try:
-            # Poll Google until the video is fully processed and ready for analysis
-            while not video_file.state or video_file.state.name != "ACTIVE":
-                if video_file.state and video_file.state.name == "FAILED":
-                    raise RuntimeError("Gemini failed to process the video file.")
-                time.sleep(3)
-                video_file = self.ai_client.files.get(name=video_file.name)
-            
-            system_instruction = (
-                "You are an expert video Quality Assurance reviewer. Watch the provided video clip. "
-                "Compare its actual visual and audio content against the expected metadata and intended viral moment. "
-                "Determine if the clip correctly captures the intended subject matter."
-            )
-            
-            user_prompt = (
-                f"Expected Title: {title}\n"
-                f"Expected Description: {desc}\n"
-                f"Editing Notes / Intended Moment: {notes}\n\n"
-                "Review the attached video. Does it accurately reflect this metadata? Describe what actually happens visually."
-            )
-            
-            logger.info("[QA REVIEW] Video active. Requesting agentic review from Gemini...")
-            response = self.ai_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=[video_file, user_prompt],
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    response_mime_type="application/json",
-                    response_schema=ClipReviewResult,
-                    temperature=0.2
-                )
-            )
-            
-            review_data = json.loads(response.text)
-            logger.info(f"[QA REVIEW] Complete. Match: {review_data.get('is_match')}, Grade: {review_data.get('grade')}")
-            return review_data
-            
-        except Exception as e:
-            logger.error(f"[QA REVIEW ERROR] {str(e)}")
-            return None
-            
-        finally:
-            logger.info("[QA REVIEW] Cleaning up remote video file from Gemini servers.")
-            try:
-                self.ai_client.files.delete(name=video_file.name)
-            except Exception as e:
-                logger.warning(f"[QA REVIEW] Could not delete remote file: {e}")
-
     def _commit_clips_to_spreadsheet(self, title, date_str, url, clip_rows):
         is_new_tab = False
         headers = [
@@ -1052,44 +1035,70 @@ class ClipYT(ctk.CTk):
         except Exception as format_err:
             logger.error(f"[SHEETS WARNING] Layout bypass on '{title}': {str(format_err)}")
 
-    def execute_clip_pipeline(self, row, filename, target_folder_id):
-        start = str(row.get("Timestamp Start", ""))
-        end = str(row.get("Timestamp End", ""))
+    def execute_clip_pipeline(self, local_vod_path, row, filename, target_folder_id):
+        needs_reslice = "New Timestamp Start" in row and row["New Timestamp Start"]
+
+        start = row.get("New Timestamp Start") if needs_reslice else str(row.get("Timestamp Start", ""))
+        end = row.get("New Timestamp End") if needs_reslice else str(row.get("Timestamp End", ""))
+
         vod_filename = os.path.abspath(os.path.join(config.output_vods_dir, filename))
-        txt_filename = os.path.abspath(os.path.join(config.output_vods_dir, filename.replace(".mp4", ".txt")))
-        txt_filename = txt_filename.replace(".mp4", ".txt")
+        local_txt_path = os.path.abspath(os.path.join(config.output_vods_dir, filename.replace(".mp4", ".txt")))
+        txt_filename = filename.replace(".mp4", ".txt")
         
         try:
-            logger.info(f"Executing manual cut for {filename}")
-            slice_local_vod(config.input_vods_dir, start, end, vod_filename)
+            logger.info(f"Executing manual cut for {filename} using {start} - {end}")
+            slice_local_vod(local_vod_path, start, end, vod_filename)
             
+            skip_upload = False
+
             # --- AGENTIC QA INJECTION ---
-            if self.enable_qa_var.get() == "on":
+            if self.enable_qa_var.get() == "on" and not needs_reslice:
                 self.safe_update_status("Running Agentic QA Review...", "#9b59b6")
-                review_data = self._agentic_clip_review(vod_filename, row)
+                review_data = agentic_clip_review(self.ai_client, vod_filename, local_vod_path, row)
                 if review_data:
                     row["QA Grade"] = review_data.get("grade")
                     row["QA Visual Description"] = review_data.get("visual_description")
                     row["QA Is Match"] = review_data.get("is_match")
                     row["QA Feedback"] = review_data.get("feedback")
                     
-                    if not review_data.get("is_match"):
+                    new_start = review_data.get("new_start_time")
+                    new_end = review_data.get("new_end_time")
+
+                    if not review_data.get("is_match") or (new_start and new_end):
+                        logger.info(f"Clip {filename} needs reslicing based on QA review.")
+                        skip_upload = True
+
+                        if new_start and new_end:
+                            row["New Timestamp Start"] = new_start
+                            row["New Timestamp End"] = new_end
+
                         filename = f"[QA_FAIL]_{filename}"
                         txt_filename = f"[QA_FAIL]_{txt_filename}"
+
+                        self.after(0, self.refresh_grid_view)
             # ---------------------------
+
+            if needs_reslice:
+                delete_cached_file(self.ai_client, local_vod_path, str(row.get("Timestamp Start", "")), str(row.get("Timestamp End", "")))
+                row["New Timestamp Start"] = ""
+                row["New Timestamp End"] = ""
 
             write_metadata_text_file(row, local_txt_path)
             
-            logger.info("Uploading asset data to Drive...")
-            self.safe_update_status("Uploading to Drive...", "#3498db")
-            upload_to_google_drive(local_staging_path, filename, 'video/mp4', target_folder_id, self.drive_service)
-            upload_to_google_drive(local_txt_path, txt_filename, 'text/plain', target_folder_id, self.drive_service)
+            if not skip_upload:
+                logger.info("Uploading asset data to Drive...")
+                self.safe_update_status("Uploading to Drive...", "#3498db")
+                upload_to_google_drive(vod_filename, filename, 'video/mp4', target_folder_id, self.drive_service)
+                upload_to_google_drive(local_txt_path, txt_filename, 'text/plain', target_folder_id, self.drive_service)
+
+                self.safe_update_status("Success!", "#2ecc71")
                 
-            self.safe_update_status("Success!", "#2ecc71")
-            
-            self.current_drive_cache.add(filename)
-            self.current_drive_cache.add(txt_filename)
-            self.after(0, self.refresh_grid_view)
+                self.current_drive_cache.add(filename)
+                self.current_drive_cache.add(txt_filename)
+                self.after(0, self.refresh_grid_view)
+            else:
+                logger.info(f"Skipping upload for {filename} pending user reslice trigger.")
+                self.safe_update_status(f"Clip needs reslice. Upload delayed.", "#f39c12")
             
         except Exception as err:
             logger.error(f"Pipeline error: {str(err)}")
@@ -1097,7 +1106,7 @@ class ClipYT(ctk.CTk):
             self.after(0, lambda e=err: self.show_error_popup(f"Pipeline Breakdown:\n\n{str(e)}"))
             
         finally:
-            for temp_file in (local_staging_path, local_txt_path):
+            for temp_file in (vod_filename, local_txt_path):
                 if os.path.exists(temp_file):
                     try:
                         os.remove(temp_file)
