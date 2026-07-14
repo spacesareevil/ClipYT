@@ -21,6 +21,7 @@ from services.transcript_service import get_formatted_transcript
 from services.drive_service import get_or_create_stream_folder, get_all_filenames_in_drive_folder, upload_to_google_drive
 from services.clip_service import slice_local_vod, write_metadata_text_file
 from services.validation_service import agentic_clip_review, delete_cached_file, purge_expired_cache
+from services.channel_cache_service import load_last_channel, load_channel_cache, save_last_channel, save_channel_cache
 from ui.components.clip_data_grid import ClipDataGrid
 from ui.error_popup_window import ErrorPopupWindow
 from ui.layout_manager_window import LayoutManagerWindow
@@ -201,13 +202,41 @@ class ClipYT(ctk.CTk):
     def run_channel_scan_worker(self, channel, limit):
         try:
             self.safe_update_channel_scan_status(f"Scanning {channel} for the most recent {limit} vods", "#2ecc71")
-            vod_playlist = fetch_vod_playlist(channel, limit=limit)
+
+            cached_vods = load_channel_cache(channel)
+            most_recent_date = None
+            if cached_vods:
+                cached_vods.sort(key=lambda x: x['date'], reverse=True)
+                if len(cached_vods) > 0:
+                    try:
+                        from datetime import datetime
+                        most_recent_date = datetime.strptime(cached_vods[0]['date'], "%Y-%m-%d")
+                    except Exception as e:
+                        logger.warning(f"Could not parse most recent date from cache: {e}")
+
+            vod_playlist = fetch_vod_playlist(channel, date_after=most_recent_date, limit=limit)
             
             self.safe_update_channel_scan_status(f"Finding VODs for clipping", "#2ecc71")
-            vods = process_channel_vods(vod_playlist)
-            vods.sort(key=lambda x: x['date'], reverse=True)
+            new_vods = process_channel_vods(vod_playlist)
+
+            all_vods = new_vods + cached_vods
+
+            # Remove duplicates based on video_id
+            seen_ids = set()
+            unique_vods = []
+            for vod in all_vods:
+                if vod['video_id'] not in seen_ids:
+                    seen_ids.add(vod['video_id'])
+                    unique_vods.append(vod)
+
+            unique_vods.sort(key=lambda x: x['date'], reverse=True)
             self.safe_update_channel_scan_status(f"VODs Found, loading for display", "#2ecc71")
-            self.scraped_vod_options = vods
+            self.scraped_vod_options = unique_vods
+
+            # Save the cache and last channel
+            save_channel_cache(channel, self.scraped_vod_options)
+            save_last_channel(channel)
+
             display_titles = [f"[{v['date']}] {v['title']}..." for v in self.scraped_vod_options]
 
             self.after(0, lambda: self.vod_select_dropdown.configure(values=display_titles))
@@ -551,7 +580,22 @@ class ClipYT(ctk.CTk):
         self.channel_input_field = ctk.CTkEntry(channel_frame, placeholder_text="e.g., @SpacesAreEvil or channel URL link")
         # Set sticky="ew" so the text box stretches dynamically to fill the empty space
         self.channel_input_field.grid(row=0, column=1, padx=5, pady=(15, 5), sticky="ew")
-        self.channel_input_field.insert(0, "@SpacesAreEvil")
+        last_channel = load_last_channel()
+        if last_channel:
+            self.channel_input_field.insert(0, last_channel)
+            cached_vods = load_channel_cache(last_channel)
+            if cached_vods:
+                self.scraped_vod_options = cached_vods
+                display_titles = [f"[{v['date']}] {v['title']}..." for v in self.scraped_vod_options]
+
+                # Setup dropdown and ai logic if cache exists
+                self.after(0, lambda: self.vod_select_dropdown.configure(values=display_titles))
+                self.after(0, lambda: self.vod_select_dropdown.set(display_titles[0]))
+                self.after(0, lambda: self.on_vod_dropdown_selected(display_titles[0]))
+                self.after(0, lambda: self.run_ai_btn.configure(state="normal"))
+                self.after(0, lambda: self.safe_update_channel_scan_status(f"Loaded {len(cached_vods)} VODs from cache for {last_channel}", "#2ecc71"))
+        else:
+            self.channel_input_field.insert(0, "@SpacesAreEvil")
 
         ctk.CTkLabel(channel_frame, text="Max VODs:", font=("Helvetica", 11, "bold")).grid(row=0, column=2, padx=(10, 2), pady=(15, 5), sticky="e")
         self.channel_limit_field = ctk.CTkEntry(channel_frame, width=50)
