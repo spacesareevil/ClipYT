@@ -7,6 +7,7 @@ from datetime import datetime, date as dt_date
 from dateutil.relativedelta import relativedelta
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from google import genai
@@ -39,7 +40,14 @@ class ClipYT(ctk.CTk):
                 creds = None
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
+                try:
+                    creds.refresh(Request())
+                except RefreshError as e:
+                    logger.warning(f"Failed to refresh token: {e}")
+                    if os.path.exists(config.token_cache_file):
+                        os.remove(config.token_cache_file)
+                    flow = InstalledAppFlow.from_client_secrets_file(config.client_secrets_file, scopes)
+                    creds = flow.run_local_server(port=0)
             else:
                 flow = InstalledAppFlow.from_client_secrets_file(config.client_secrets_file, scopes)
                 creds = flow.run_local_server(port=0)
