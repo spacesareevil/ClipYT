@@ -28,6 +28,8 @@ class Settings:
     output_vods_dir: str = "./temp"
     cache_dir: str = "./cache/transcripts"
     gemini_cache_dir: str = "./cache/gemini"
+    channel_cache_dir: str = "./cache/channels"
+    last_channel_cache_file: str = "./cache/channels/last_channel.json"
 
     def validate_startup(self):
         if not self.gemini_api_key:
@@ -38,5 +40,6 @@ class Settings:
         os.makedirs(self.output_vods_dir, exist_ok=True)
         os.makedirs(self.cache_dir, exist_ok=True)
         os.makedirs(self.gemini_cache_dir, exist_ok=True)
+        os.makedirs(self.channel_cache_dir, exist_ok=True)
 
 config = Settings()
