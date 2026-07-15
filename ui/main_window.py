@@ -21,7 +21,7 @@ from services.transcript_service import get_formatted_transcript
 from services.drive_service import get_or_create_stream_folder, get_all_filenames_in_drive_folder, upload_to_google_drive
 from services.clip_service import slice_local_vod, write_metadata_text_file
 from services.validation_service import agentic_clip_review, delete_cached_file, purge_expired_cache
-from services.channel_cache_service import load_last_channel, load_channel_cache, save_last_channel, save_channel_cache
+from services.channel_cache_service import load_last_channel, load_channel_cache, save_last_channel, save_channel_cache, is_cache_stale
 from ui.components.clip_data_grid import ClipDataGrid
 from ui.error_popup_window import ErrorPopupWindow
 from ui.layout_manager_window import LayoutManagerWindow
@@ -183,41 +183,74 @@ class ClipYT(ctk.CTk):
         self.executor.submit(self.run_batch_worker)
 
     def start_channel_scan_thread(self):
-        self.safe_update_batch_status(f"Begin Fetching Recent Live VODs", "#2ecc71")
+        self.safe_update_channel_scan_status(f"Begin Fetching Recent Live VODs", "#2ecc71")
         target_channel = self.channel_input_field.get().strip()
         if not target_channel:
-            self.safe_update_batch_status(f"Error Scanning", "#e74c3c")
+            self.safe_update_channel_scan_status(f"Error Scanning", "#e74c3c")
             self.show_error_popup("Scan Error:\n\nPlease enter a valid channel handle or profile link URL.")
             return
         try:
-            limit_val = int(self.channel_limit_field.get().strip())
+            days_back = int(self.channel_limit_field.get().strip())
         except ValueError:
-            limit_val = 50 # Safe fallback if user typed letters
+            days_back = 60 # Safe fallback if user typed letters
         
         self.scan_channel_btn.configure(state="disabled", text="⏳ Extracting Live VODs...")
         
 
-        self.executor.submit(self.run_channel_scan_worker, target_channel, limit_val)
-        
-    def run_channel_scan_worker(self, channel, limit):
+        self.executor.submit(self.run_channel_scan_worker, target_channel, days_back, False)
+
+    def start_channel_refresh_thread(self):
+        self.safe_update_channel_scan_status(f"Refreshing VOD Cache", "#2ecc71")
+        target_channel = self.channel_input_field.get().strip()
+        if not target_channel:
+            self.safe_update_channel_scan_status(f"Error Scanning", "#e74c3c")
+            self.show_error_popup("Scan Error:\n\nPlease enter a valid channel handle or profile link URL.")
+            return
         try:
-            self.safe_update_channel_scan_status(f"Scanning {channel} for the most recent {limit} vods", "#2ecc71")
+            days_back = int(self.channel_limit_field.get().strip())
+        except ValueError:
+            days_back = 60 # Safe fallback if user typed letters
+
+        self.refresh_channel_btn.configure(state="disabled", text="⏳ Refreshing Cache...")
+
+
+        self.executor.submit(self.run_channel_scan_worker, target_channel, days_back, True)
+        
+    def run_channel_scan_worker(self, channel, days_back, force_refresh):
+        try:
+            self.safe_update_channel_scan_status(f"Scanning {channel} for VODs in the last {days_back} days", "#2ecc71")
+            from datetime import datetime, timedelta
+
+            target_date = (datetime.now() - timedelta(days=days_back)).replace(hour=0, minute=0, second=0, microsecond=0)
 
             cached_vods = load_channel_cache(channel)
-            most_recent_date = None
-            if cached_vods:
-                cached_vods.sort(key=lambda x: x['date'], reverse=True)
-                if len(cached_vods) > 0:
-                    try:
-                        from datetime import datetime
-                        most_recent_date = datetime.strptime(cached_vods[0]['date'], "%Y-%m-%d")
-                    except Exception as e:
-                        logger.warning(f"Could not parse most recent date from cache: {e}")
-
-            vod_playlist = fetch_vod_playlist(channel, date_after=most_recent_date, limit=limit)
+            stale = is_cache_stale(channel)
             
-            self.safe_update_channel_scan_status(f"Finding VODs for clipping", "#2ecc71")
-            new_vods = process_channel_vods(vod_playlist)
+            new_vods = []
+            if stale or force_refresh:
+                self.safe_update_channel_scan_status(f"Fetching VODs from YouTube via yt-dlp", "#2ecc71")
+                # Try to find the most recent date in cache to optimize the yt-dlp fetch if not forcing refresh
+                most_recent_date = None
+                if cached_vods and not force_refresh:
+                    cached_vods.sort(key=lambda x: x['date'], reverse=True)
+                    if len(cached_vods) > 0:
+                        try:
+                            cached_date = datetime.strptime(cached_vods[0]['date'], "%Y-%m-%d")
+                            # Don't ask for things older than the target_date anyway
+                            most_recent_date = max(cached_date, target_date)
+                        except Exception as e:
+                            logger.warning(f"Could not parse most recent date from cache: {e}")
+
+                # If force refresh or no valid cached date, just use target_date
+                if not most_recent_date:
+                    most_recent_date = target_date
+
+                vod_playlist = fetch_vod_playlist(channel, date_after=most_recent_date, limit=0)
+
+                self.safe_update_channel_scan_status(f"Finding VODs for clipping", "#2ecc71")
+                new_vods = process_channel_vods(vod_playlist)
+            else:
+                self.safe_update_channel_scan_status(f"Cache is fresh, loading from local file", "#2ecc71")
 
             all_vods = new_vods + cached_vods
 
@@ -230,11 +263,25 @@ class ClipYT(ctk.CTk):
                     unique_vods.append(vod)
 
             unique_vods.sort(key=lambda x: x['date'], reverse=True)
-            self.safe_update_channel_scan_status(f"VODs Found, loading for display", "#2ecc71")
-            self.scraped_vod_options = unique_vods
+
+            # Filter unique_vods to only show within the days_back limit
+            filtered_vods = []
+            for vod in unique_vods:
+                try:
+                    vod_date = datetime.strptime(vod['date'], "%Y-%m-%d")
+                    if vod_date >= target_date:
+                        filtered_vods.append(vod)
+                except:
+                    # Keep if we can't parse the date
+                    filtered_vods.append(vod)
+
+            self.safe_update_channel_scan_status(f"Found {len(filtered_vods)} VODs within the last {days_back} days", "#2ecc71")
+
+            self.scraped_vod_options = filtered_vods
 
             # Save the cache and last channel
-            save_channel_cache(channel, self.scraped_vod_options)
+            # We want to save the entire list of VODs (all_vods), not just the filtered ones
+            save_channel_cache(channel, unique_vods)
             save_last_channel(channel)
 
             display_titles = [f"[{v['date']}] {v['title']}..." for v in self.scraped_vod_options]
@@ -256,6 +303,7 @@ class ClipYT(ctk.CTk):
             self.after(0, lambda: self.run_ai_btn.configure(state="disabled"))
         finally:
             self.after(0, lambda: self.scan_channel_btn.configure(state="normal", text="🔍 Fetch Recent Live VODs"))
+            self.after(0, lambda: self.refresh_channel_btn.configure(state="normal", text="🔄 Refresh Cache"))
 
     def start_ai_ingestion_thread(self):
         title = self.new_stream_title.get().strip()
@@ -597,14 +645,16 @@ class ClipYT(ctk.CTk):
         else:
             self.channel_input_field.insert(0, "@SpacesAreEvil")
 
-        ctk.CTkLabel(channel_frame, text="Max VODs:", font=("Helvetica", 11, "bold")).grid(row=0, column=2, padx=(10, 2), pady=(15, 5), sticky="e")
+        ctk.CTkLabel(channel_frame, text="Scan X Days Back:", font=("Helvetica", 11, "bold")).grid(row=0, column=2, padx=(10, 2), pady=(15, 5), sticky="e")
         self.channel_limit_field = ctk.CTkEntry(channel_frame, width=50)
-        self.channel_limit_field.insert(0, "50")
+        self.channel_limit_field.insert(0, "60")
         self.channel_limit_field.grid(row=0, column=3, padx=(0, 10), pady=(15, 5), sticky="w")
 
         self.scan_channel_btn = ctk.CTkButton(channel_frame, text="🔍 Fetch Recent Live VODs", command=self.start_channel_scan_thread)
-        # Anchor the button to the East edge
         self.scan_channel_btn.grid(row=0, column=4, padx=(0, 5), pady=(15, 5), sticky="e") 
+
+        self.refresh_channel_btn = ctk.CTkButton(channel_frame, text="🔄 Refresh Cache", command=self.start_channel_refresh_thread)
+        self.refresh_channel_btn.grid(row=0, column=5, padx=(0, 5), pady=(15, 5), sticky="e")
 
         # --- ROW 1: The Selection Dropdown ---
         ctk.CTkLabel(channel_frame, text="Select Target Video:", font=("Helvetica", 11, "bold")).grid(row=1, column=0, padx=15, pady=(15, 5), sticky="w")
