@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import time
 from config.settings import config
 
 logger = logging.getLogger(__name__)
@@ -12,6 +13,20 @@ def sanitize_channel_name(channel_name: str) -> str:
 def get_channel_cache_path(channel_name: str) -> str:
     safe_name = sanitize_channel_name(channel_name)
     return os.path.join(config.channel_cache_dir, f"{safe_name}.json")
+
+def is_cache_stale(channel_name: str) -> bool:
+    """Checks if the cache file for a channel is older than 24 hours."""
+    cache_path = get_channel_cache_path(channel_name)
+    if not os.path.exists(cache_path):
+        return True
+
+    file_mtime = os.path.getmtime(cache_path)
+    current_time = time.time()
+    # 24 hours in seconds = 86400
+    if (current_time - file_mtime) > 86400:
+        return True
+
+    return False
 
 def load_channel_cache(channel_name: str) -> list:
     """Loads cached VODs for a given channel."""
