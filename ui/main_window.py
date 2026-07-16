@@ -245,7 +245,7 @@ class ClipYT(ctk.CTk):
                 if not most_recent_date:
                     most_recent_date = target_date
 
-                vod_playlist = fetch_vod_playlist(channel, date_after=most_recent_date, limit=0)
+                vod_playlist = fetch_vod_playlist(channel, date_after=most_recent_date)
 
                 self.safe_update_channel_scan_status(f"Finding VODs for clipping", "#2ecc71")
                 new_vods = process_channel_vods(vod_playlist)
@@ -354,7 +354,7 @@ class ClipYT(ctk.CTk):
             lookback_months = int(str(months_input).strip())
             start_threshold = dt_date.today() - relativedelta(months=lookback_months)
             
-            vod_playlist = fetch_vod_playlist(channel, date_after=start_threshold, limit=0)
+            vod_playlist = fetch_vod_playlist(channel, date_after=start_threshold)
             all_scraped_vods = process_channel_vods(vod_playlist)
             target_batch = []
             
