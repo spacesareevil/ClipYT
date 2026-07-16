@@ -114,12 +114,9 @@ def _build_channel_url(channel_input: str) -> str:
         url = clean_input if "/streams" in clean_input else f"{clean_input}/streams"
     return url
 
-def _fetch_playlist_data(url: str, date_after, limit: int) -> list:
+def _fetch_playlist_data(url: str, date_after) -> list:
     cmd = ['yt-dlp', '--dump-json', '--no-download', '--ignore-no-formats-error']
-    
-    # Apply the limit unless the user passed 0 (which means fetch all)
-    if limit > 0:
-        cmd.extend(['--playlist-end', str(limit)])
+
 
     if date_after:
         date_str = date_after.strftime('%Y%m%d')
@@ -142,8 +139,8 @@ def _fetch_playlist_data(url: str, date_after, limit: int) -> list:
             playlist_data.append(json.loads(line))
     return playlist_data
 
-def fetch_vod_playlist(channel_input: str, date_after=None, limit: int = 50) -> list:
-    logger.info(f"Fetching {limit} VODs from Channel {channel_input}");
+def fetch_vod_playlist(channel_input: str, date_after=None) -> list:
+    logger.info(f"Fetching VODs from Channel {channel_input}");
     url = _build_channel_url(channel_input)
-    vod_playlist = _fetch_playlist_data(url, date_after, limit)
+    vod_playlist = _fetch_playlist_data(url, date_after)
     return vod_playlist
