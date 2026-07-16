@@ -114,14 +114,17 @@ def _build_channel_url(channel_input: str) -> str:
         url = clean_input if "/streams" in clean_input else f"{clean_input}/streams"
     return url
 
-def _fetch_playlist_data(url: str, date_after) -> list:
+def _fetch_playlist_data(url: str, date_after, date_before=None) -> list:
     cmd = ['yt-dlp', '--dump-json', '--no-download', '--ignore-no-formats-error']
-
 
     if date_after:
         date_str = date_after.strftime('%Y%m%d')
         cmd.extend(['--dateafter', date_str])
         
+    if date_before:
+        date_before_str = date_before.strftime('%Y%m%d')
+        cmd.extend(['--datebefore', date_before_str])
+
     cmd.append(url)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=300)
@@ -139,8 +142,38 @@ def _fetch_playlist_data(url: str, date_after) -> list:
             playlist_data.append(json.loads(line))
     return playlist_data
 
-def fetch_vod_playlist(channel_input: str, date_after=None) -> list:
-    logger.info(f"Fetching VODs from Channel {channel_input}");
+from datetime import timedelta
+
+def fetch_vod_playlist(channel_input: str, date_after=None, limit: int = 50) -> list:
+    logger.info(f"Fetching VODs from Channel {channel_input} with limit of {limit} days");
     url = _build_channel_url(channel_input)
-    vod_playlist = _fetch_playlist_data(url, date_after)
+
+    if not date_after:
+        date_after = dt_date.today() - timedelta(days=limit)
+
+    current_end_date = dt_date.today()
+
+    chunks = []
+    current_start = date_after
+    while current_start <= current_end_date:
+        chunk_end = current_start + timedelta(days=6)
+        if chunk_end > current_end_date:
+            chunk_end = current_end_date
+        chunks.append((current_start, chunk_end))
+        current_start = chunk_end + timedelta(days=1)
+
+    vod_playlist = []
+
+    # max_workers=5 keeps us fast without getting rate-limited by YouTube
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(_fetch_playlist_data, url, start, end) for start, end in chunks]
+
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result:
+                    vod_playlist.extend(result)
+            except Exception as e:
+                logger.error(f"Error fetching playlist chunk: {e}")
+
     return vod_playlist
