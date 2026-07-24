@@ -19,6 +19,9 @@ def is_cache_stale(channel_name: str) -> bool:
     cache_path = get_channel_cache_path(channel_name)
     if not os.path.exists(cache_path):
         return True
+    
+    if os.path.getsize(cache_path) <= 2:
+        return True
 
     file_mtime = os.path.getmtime(cache_path)
     current_time = time.time()

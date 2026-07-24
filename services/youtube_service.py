@@ -1,14 +1,13 @@
 import re
-import json
 import logging
-import subprocess
-import urllib.request
 import yt_dlp
 import concurrent.futures
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from datetime import datetime, date as dt_date
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
+from urllib.parse import urlparse
+from services.channel_cache_service import save_channel_cache
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +26,11 @@ def extract_youtube_id(url: str) -> str:
     return match.group(1) if match else None
 
 def validate_single_vod(vod):
-    live_status = vod['live_status']
-    video_id = vod['id']
-    title= vod['title']    
+    vod_details = _get_vod_details(vod)
+
+    live_status = vod_details['live_status']
+    video_id = vod_details['id']
+    title= vod_details['title']    
     
     if live_status == "is_upcoming":    #Ignore Scheduled Streams
         logger.info(f"CHECK FAILED ON {video_id}-{title[0:20]}: VOD is scheduled")
@@ -39,15 +40,15 @@ def validate_single_vod(vod):
         logger.info(f"CHECK FAILED ON {video_id}-{title[0:20]}: VOD processing")
         return None
         
-    height = vod['height']
-    width = vod['width']
+    height = vod_details['height']
+    width = vod_details['width']
 
     if height < width:                  #Ignore Horizontal Format (maybe make a toggle for horizontal/vertical?)
         logger.info(f"CHECK FAILED ON {video_id}-{title[0:20]}: Horizontal VOD")
         return None
     
-    automatic_captions = vod.get('automatic_captions')
-    subtitles = vod.get('subtitles')
+    automatic_captions = vod_details.get('automatic_captions')
+    subtitles = vod_details.get('subtitles')
 
     en_captions_url = None
     
@@ -69,14 +70,14 @@ def validate_single_vod(vod):
         logger.info(f"CHECK FAILED ON {video_id}-{title[0:20]}: No English VTT captions found")
         return None
 
-    raw_date = vod.get('upload_date', '')
+    raw_date = vod_details.get('upload_date', '')
     formatted_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}" if raw_date and len(raw_date) == 8 else datetime.today().strftime('%Y-%m-%d')
     logger.info(f"CHECK PASSED ON {video_id}-{title[0:20]}")
     return VerticalVodData(
         title = title,
-        url = vod['webpage_url'],
+        url = vod_details['webpage_url'],
         date = formatted_date,
-        creator = vod['uploader'],
+        creator = vod_details['uploader'],
         captions_url = en_captions_url,
         video_id=video_id
     )
@@ -104,6 +105,25 @@ def process_channel_vods(flat_playlist_vods):
     logger.info(f"Returning {len(final_valid_vods)} VODs");               
     return final_valid_vods
 
+def _get_vod_details(vod):
+
+    vod_opts = {
+        'simulate': True,            # Do not download the video file
+        'ignoreerrors': True,
+        'writesubtitles': True,      # Tells yt-dlp to look for and map subtitles
+        'writeautomaticsub': True,   # Includes YouTube's auto-generated captions
+    } 
+
+    vod_url = vod['url']
+
+    try:
+        with yt_dlp.YoutubeDL(vod_opts) as ydl:
+            vod_data = ydl.extract_info(vod_url, download=False)
+    except Exception as e:
+        raise RuntimeError("An error occurred while retrieving individual VOD information: {e}")
+    
+    return vod_data           
+
 def _build_channel_url(channel_input: str) -> str:
     clean_input = channel_input.strip()
     if not clean_input.startswith("http"):
@@ -114,66 +134,60 @@ def _build_channel_url(channel_input: str) -> str:
         url = clean_input if "/streams" in clean_input else f"{clean_input}/streams"
     return url
 
-def _fetch_playlist_data(url: str, date_after, date_before=None) -> list:
-    cmd = ['yt-dlp', '--dump-json', '--no-download', '--ignore-no-formats-error']
+def _get_channel_name_from_url(channel_url: str) -> str:
+    return channel_url.split('@')[-1].split('/')[0]
 
-    if date_after:
-        date_str = date_after.strftime('%Y%m%d')
-        cmd.extend(['--dateafter', date_str])
+def _fetch_playlist_data(url: str, start_date, end_date=datetime.today) -> list:
+    if start_date:
+        start_date_str = start_date.strftime('%Y%m%d')
+        start_timestamp = datetime.strptime(start_date_str, "%Y%m%d").replace(tzinfo=timezone.utc).timestamp()
         
-    if date_before:
-        date_before_str = date_before.strftime('%Y%m%d')
-        cmd.extend(['--datebefore', date_before_str])
-
-    cmd.append(url)
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=300)
-    except subprocess.TimeoutExpired:
-        logger.error(f"yt-dlp scan timed out after 300 seconds for {url}")
-        raise RuntimeError("The YouTube channel scan timed out after 5 minutes. YouTube may be throttling the connection or the channel archive is massive. Please try again.")
+    if end_date:
+        end_date_str = end_date.strftime('%Y%m%d')
+        end_timestamp = datetime.strptime(end_date_str, "%Y%m%d").replace(tzinfo=timezone.utc).timestamp()
     
-    if result.returncode != 0:
-        logger.error(f"yt-dlp failure: {result.stderr}")
-        raise RuntimeError(f"yt-dlp Live Stream scanning operation failure: {result.stderr}")
+    ydl_opts = {
+        'simulate': True, # Equivalent to --no-download
+        'ignoreerrors': 'only_download', # Equivalent to --ignore-no-formats-error
+        'extract_flat': 'in_playlist',
+        'extractor_args': {
+            'youtubetab': {
+                'approximate_date': ['true']
+            }
+        }
+    }
 
-    playlist_data = []
-    for line in result.stdout.strip().split('\n'):
-        if line:
-            playlist_data.append(json.loads(line))
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # This returns the data directly as a Python dictionary
+            playlist_dict = ydl.extract_info(url, download=False)
+            playlist_data = []
+
+            if playlist_dict and 'entries' in playlist_dict:
+                for entry in playlist_dict['entries']:
+                    video_timestamp = entry.get('timestamp')
+                    if video_timestamp is not None and start_timestamp <= video_timestamp <= end_timestamp:
+                        playlist_data.append(entry)
+    except Exception as e:
+        logger.error(f"An error occurred while scanning: {e}")
+        raise RuntimeError("An error occurred while scanning: {e}")
+
+    # CACHE PLAYLIST_DATA
+    channel_name = _get_channel_name_from_url(url)
+    save_channel_cache(channel_name, playlist_data)
     return playlist_data
 
-from datetime import timedelta
-
-def fetch_vod_playlist(channel_input: str, date_after=None, limit: int = 50) -> list:
-    logger.info(f"Fetching VODs from Channel {channel_input} with limit of {limit} days");
+def fetch_vod_playlist(channel_input: str, days_back=30) -> list:
+    logger.info(f"Fetching VODs from Channel {channel_input} going {days_back} days back");
     url = _build_channel_url(channel_input)
 
-    if not date_after:
-        date_after = dt_date.today() - timedelta(days=limit)
+    end_date = datetime.combine(dt_date.today(), datetime.min.time())
+    start_date = (datetime.now() - timedelta(days=days_back)).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    current_end_date = dt_date.today()
-
-    chunks = []
-    current_start = date_after
-    while current_start <= current_end_date:
-        chunk_end = current_start + timedelta(days=6)
-        if chunk_end > current_end_date:
-            chunk_end = current_end_date
-        chunks.append((current_start, chunk_end))
-        current_start = chunk_end + timedelta(days=1)
-
-    vod_playlist = []
-
-    # max_workers=5 keeps us fast without getting rate-limited by YouTube
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(_fetch_playlist_data, url, start, end) for start, end in chunks]
-
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                if result:
-                    vod_playlist.extend(result)
-            except Exception as e:
-                logger.error(f"Error fetching playlist chunk: {e}")
+    
+    try:
+        vod_playlist = _fetch_playlist_data(url, start_date, end_date)
+    except Exception as e:
+        logger.error(f"Error fetching playlist chunk: {e}")
 
     return vod_playlist

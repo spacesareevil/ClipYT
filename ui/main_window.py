@@ -209,7 +209,7 @@ class ClipYT(ctk.CTk):
         try:
             days_back = int(self.channel_limit_field.get().strip())
         except ValueError:
-            days_back = 60 # Safe fallback if user typed letters
+            days_back = 30 # Safe fallback if user typed letters
 
         self.refresh_channel_btn.configure(state="disabled", text="⏳ Refreshing Cache...")
 
@@ -219,9 +219,7 @@ class ClipYT(ctk.CTk):
     def run_channel_scan_worker(self, channel, days_back, force_refresh):
         try:
             self.safe_update_channel_scan_status(f"Scanning {channel} for VODs in the last {days_back} days", "#2ecc71")
-            from datetime import datetime, timedelta
-
-            target_date = (datetime.now() - timedelta(days=days_back)).replace(hour=0, minute=0, second=0, microsecond=0)
+            from datetime import datetime
 
             cached_vods = load_channel_cache(channel)
             stale = is_cache_stale(channel)
@@ -229,23 +227,15 @@ class ClipYT(ctk.CTk):
             new_vods = []
             if stale or force_refresh:
                 self.safe_update_channel_scan_status(f"Fetching VODs from YouTube via yt-dlp", "#2ecc71")
-                # Try to find the most recent date in cache to optimize the yt-dlp fetch if not forcing refresh
-                most_recent_date = None
                 if cached_vods and not force_refresh:
                     cached_vods.sort(key=lambda x: x['date'], reverse=True)
                     if len(cached_vods) > 0:
                         try:
                             cached_date = datetime.strptime(cached_vods[0]['date'], "%Y-%m-%d")
-                            # Don't ask for things older than the target_date anyway
-                            most_recent_date = max(cached_date, target_date)
                         except Exception as e:
                             logger.warning(f"Could not parse most recent date from cache: {e}")
 
-                # If force refresh or no valid cached date, just use target_date
-                if not most_recent_date:
-                    most_recent_date = target_date
-
-                vod_playlist = fetch_vod_playlist(channel, date_after=most_recent_date)
+                vod_playlist = fetch_vod_playlist(channel, days_back)
 
                 self.safe_update_channel_scan_status(f"Finding VODs for clipping", "#2ecc71")
                 new_vods = process_channel_vods(vod_playlist)
@@ -354,7 +344,7 @@ class ClipYT(ctk.CTk):
             lookback_months = int(str(months_input).strip())
             start_threshold = dt_date.today() - relativedelta(months=lookback_months)
             
-            vod_playlist = fetch_vod_playlist(channel, date_after=start_threshold)
+            vod_playlist = fetch_vod_playlist(channel, days_back=start_threshold)
             all_scraped_vods = process_channel_vods(vod_playlist)
             target_batch = []
             
@@ -647,7 +637,7 @@ class ClipYT(ctk.CTk):
 
         ctk.CTkLabel(channel_frame, text="Scan X Days Back:", font=("Helvetica", 11, "bold")).grid(row=0, column=2, padx=(10, 2), pady=(15, 5), sticky="e")
         self.channel_limit_field = ctk.CTkEntry(channel_frame, width=50)
-        self.channel_limit_field.insert(0, "60")
+        self.channel_limit_field.insert(0, "30")
         self.channel_limit_field.grid(row=0, column=3, padx=(0, 10), pady=(15, 5), sticky="w")
 
         self.scan_channel_btn = ctk.CTkButton(channel_frame, text="🔍 Fetch Recent Live VODs", command=self.start_channel_scan_thread)

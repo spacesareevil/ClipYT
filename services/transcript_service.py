@@ -3,7 +3,6 @@ import re
 import json
 import logging
 import difflib
-import yt_dlp
 import requests
 import io
 import webvtt
