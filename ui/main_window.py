@@ -370,7 +370,6 @@ class ClipYT(ctk.CTk):
         self.active_broadcast_date = "" 
         self.sort_states = {} 
         self.is_batch_processing = False  
-        self.canvas_window = None
         self.scraped_vod_options = []
         self.source_file_exists = False
         
@@ -555,22 +554,6 @@ class ClipYT(ctk.CTk):
                 # 3. AND THEN ADD THE NEW GRID WE JUST MADE
         self.clip_grid = ClipDataGrid(self.studio_tab, width=900, height=500) 
         self.clip_grid.grid(row=2, column=0, padx=20, pady=(0, 20), sticky="nsew")
-
-        self.outer_container = ctk.CTkFrame(self.studio_tab, fg_color="#1d1d1d")
-        self.outer_container.grid(row=2, column=0, padx=20, pady=15, sticky="nsew")
-        self.outer_container.grid_columnconfigure(0, weight=1)
-        self.outer_container.grid_rowconfigure(0, weight=1)
-
-        self.canvas = tk.Canvas(self.outer_container, bg="#1d1d1d", bd=0, highlightthickness=0)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-
-        self.v_scrollbar = ctk.CTkScrollbar(self.outer_container, orientation="vertical", command=self.canvas.yview)
-        self.v_scrollbar.grid(row=0, column=1, sticky="ns")
-        self.h_scrollbar = ctk.CTkScrollbar(self.outer_container, orientation="horizontal", command=self.canvas.xview)
-        self.h_scrollbar.grid(row=1, column=0, sticky="ew")
-
-        self.canvas.configure(xscrollcommand=self.h_scrollbar.set, yscrollcommand=self.v_scrollbar.set)
-        self.table_content_frame = None
 
         self.status_var = tk.StringVar(value="Status: Ready")
         self.status_label = ctk.CTkLabel(self.studio_tab, textvariable=self.status_var, font=self.small_light_font)
