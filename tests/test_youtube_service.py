@@ -1,6 +1,6 @@
 import unittest
 from unittest.mock import patch
-from services.youtube_service import extract_youtube_id, validate_single_vod
+from services.youtube_service import extract_youtube_id, single_vod_is_vertical_and_valid
 
 class TestYoutubeService(unittest.TestCase):
     def test_extract_youtube_id_valid_urls(self):
@@ -54,7 +54,7 @@ class TestYoutubeService(unittest.TestCase):
             'height': 1080,
             'automatic_captions': None
         }
-        self.assertIsNone(validate_single_vod(test_vod))
+        self.assertIsNone(single_vod_is_vertical_and_valid(test_vod))
 
     def test_validate_single_vod_no_captions(self):
         test_vod = {
@@ -65,7 +65,7 @@ class TestYoutubeService(unittest.TestCase):
             'height': 1920,
             'automatic_captions': None
         }
-        self.assertIsNone(validate_single_vod(test_vod))
+        self.assertIsNone(single_vod_is_vertical_and_valid(test_vod))
 
     def test_validate_single_vod_success(self):
         test_vod = {
@@ -81,7 +81,7 @@ class TestYoutubeService(unittest.TestCase):
             'uploader': 'Test Creator',
             'upload_date': '20231026'
         }
-        result = validate_single_vod(test_vod)
+        result = single_vod_is_vertical_and_valid(test_vod)
 
         self.assertIsNotNone(result)
         self.assertEqual(result.title, 'Test Title')

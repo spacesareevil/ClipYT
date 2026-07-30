@@ -3,7 +3,7 @@ import tkinter as tk
 import customtkinter as ctk
 import gspread
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, date as dt_date
+from datetime import datetime, date as dt_date, timezone
 from dateutil.relativedelta import relativedelta
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -12,16 +12,16 @@ from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from google import genai
 from google.genai import types
-
+from tkinter import font
 from config.settings import config
 from models.clip_models import IngestionAnalysisResult, ClipReviewResult
 from utils.filenames import clean_filename, build_clip_filename
-from services.youtube_service import extract_youtube_id, fetch_vod_playlist, process_channel_vods
+from services.youtube_service import extract_youtube_id, fetch_vod_playlist, find_vertical_valid_vods
 from services.transcript_service import get_formatted_transcript
 from services.drive_service import get_or_create_stream_folder, get_all_filenames_in_drive_folder, upload_to_google_drive
 from services.clip_service import slice_local_vod, write_metadata_text_file
 from services.validation_service import agentic_clip_review, delete_cached_file, purge_expired_cache
-from services.channel_cache_service import load_last_channel, load_channel_cache, save_last_channel, save_channel_cache, is_cache_stale
+from services.channel_cache_service import load_last_channel, load_channel_playlist_cache, save_last_channel, save_channel_playlist_cache, is_playlist_cache_stale, load_channel_vod_cache
 from ui.components.clip_data_grid import ClipDataGrid
 from ui.error_popup_window import ErrorPopupWindow
 from ui.layout_manager_window import LayoutManagerWindow
@@ -30,6 +30,7 @@ from ui.batch_verification_window import BatchVerificationWindow
 logger = logging.getLogger(__name__)
 
 class ClipYT(ctk.CTk):
+    # Establishes connection to Google, used in __init__
     def connect_to_google(self):
         scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = None
@@ -60,25 +61,31 @@ class ClipYT(ctk.CTk):
         self.drive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
         self.stream_list_tab = self.sheet.worksheet("Stream List")
 
+    # Display Error Popup
     def show_error_popup(self, error_message):
         ErrorPopupWindow(self, error_message)
 
+    # VOD Clip Status Update
     def safe_update_status(self, text, color):
         self.after(0, lambda: self.status_var.set(text))
         self.after(0, lambda: self.status_label.configure(text_color=color))
 
+    # Find VOD Status Update
     def safe_update_channel_scan_status(self, text, color):
         self.after(0, lambda: self.channel_scan_var.set(text))
         self.after(0, lambda: self.channel_scan_label.configure(text_color=color))
 
+    # Batch Processing Status Update
     def safe_update_batch_status(self, text, color):
         self.after(0, lambda: self.batch_status_var.set(text))
         self.after(0, lambda: self.batch_status_label.configure(text_color=color))
 
+    # Batch Status Bar???
     def stop_loading_bar(self):
         self.batch_progress_bar.stop()
         self.batch_progress_bar.grid_remove()
 
+    # Finish Batch UI Setup
     def finalize_batch_ui(self):
         self.is_batch_processing = False
         self.batch_btn.configure(state="normal", text="🎬 Process All Pending Clips")
@@ -87,7 +94,8 @@ class ClipYT(ctk.CTk):
             self.check_source_btn.configure(state="disabled")
         else:
             self.check_source_btn.configure(state="normal")
-            
+
+    # Batch Worksheet Dropdown Refresh        
     def refresh_worksheet_dropdowns(self):
         self.stream_titles = self.stream_list_tab.col_values(1)[1:] 
         self.dropdown.configure(values=self.stream_titles, command=self.on_worksheet_selected)
@@ -95,6 +103,7 @@ class ClipYT(ctk.CTk):
             self.dropdown.set(self.stream_titles[0])
             self.on_worksheet_selected(self.stream_titles[0])
 
+    # Batch Worksheet Dropdown Selection Event
     def on_worksheet_selected(self, choice):
         if self.is_batch_processing:
             self.show_error_popup("Batch Lock Error:\n\nCannot transition streams while queues run.")
@@ -104,29 +113,17 @@ class ClipYT(ctk.CTk):
         self.active_broadcast_date = "" 
         self.executor.submit(self.load_stream_clips)
 
-    def on_vod_dropdown_selected(self, selected_title_short):
-        if not self.scraped_vod_options: return
-        selected_idx = self.vod_select_dropdown._values.index(selected_title_short)
-        target_vod = self.scraped_vod_options[selected_idx]
-
-        self.new_stream_title.delete(0, tk.END)
-        self.new_stream_date.delete(0, tk.END)
-        self.new_stream_poster.delete(0, tk.END)
-        self.new_stream_url.delete(0, tk.END)
-
-        self.new_stream_title.insert(0, clean_filename(target_vod['title']))
-        self.new_stream_date.insert(0, target_vod['date'])
-        self.new_stream_poster.insert(0, target_vod['creator'])
-        self.new_stream_url.insert(0, target_vod['url'])
-
+    # Make Clips Tab - Layout Manager
     def open_layout_manager(self):
         if self.is_batch_processing: return
         LayoutManagerWindow(self, self.current_column_order, self.column_visibility, self.apply_new_column_order)
 
+    # Make Clips Tab - Layout Manager - Reorder Columns
     def apply_new_column_order(self, reordered_list):
         self.current_column_order = reordered_list
         self.refresh_grid_view()
 
+    # Refresh Worksheet Grid
     def refresh_grid_view(self):
         """Prepares the drive cache data and passes it to the grid component."""
         if not hasattr(self, 'current_clips_data') or not self.current_clips_data:
@@ -159,6 +156,7 @@ class ClipYT(ctk.CTk):
         # Send the properly packaged data to the grid!
         self.clip_grid.render_data_grid(formatted_data)
 
+    # Check for local VOD
     def recheck_source_file(self):
         if not self.active_choice: return
         
@@ -176,12 +174,14 @@ class ClipYT(ctk.CTk):
         else:
             self.show_error_popup(f"File Still Missing:\n\nCould not find '{safe_title}.mp4'\nin the {config.input_vods_dir} folder.\n\nPlease double check the filename exactly matches.")
 
+    # Process All Pending VOD Clips
     def start_batch_process(self):
         self.is_batch_processing = True
         self.batch_btn.configure(state="disabled", text="⏳ Processing Batch Queue...")
         self.dropdown.configure(state="disabled")
         self.executor.submit(self.run_batch_worker)
 
+    # Find Clips from VODs (Find VODs Button)
     def start_channel_scan_thread(self):
         self.safe_update_channel_scan_status(f"Begin Fetching Recent Live VODs", "#2ecc71")
         target_channel = self.channel_input_field.get().strip()
@@ -192,94 +192,41 @@ class ClipYT(ctk.CTk):
         try:
             days_back = int(self.channel_limit_field.get().strip())
         except ValueError:
-            days_back = 60 # Safe fallback if user typed letters
+            days_back = 30 # Safe fallback if user typed letters
         
         self.scan_channel_btn.configure(state="disabled", text="⏳ Extracting Live VODs...")
-        
 
-        self.executor.submit(self.run_channel_scan_worker, target_channel, days_back, False)
+        self.executor.submit(self.run_find_vods_worker, target_channel, days_back)
 
-    def start_channel_refresh_thread(self):
-        self.safe_update_channel_scan_status(f"Refreshing VOD Cache", "#2ecc71")
-        target_channel = self.channel_input_field.get().strip()
-        if not target_channel:
-            self.safe_update_channel_scan_status(f"Error Scanning", "#e74c3c")
-            self.show_error_popup("Scan Error:\n\nPlease enter a valid channel handle or profile link URL.")
-            return
-        try:
-            days_back = int(self.channel_limit_field.get().strip())
-        except ValueError:
-            days_back = 30 # Safe fallback if user typed letters
-
-        self.refresh_channel_btn.configure(state="disabled", text="⏳ Refreshing Cache...")
-
-
-        self.executor.submit(self.run_channel_scan_worker, target_channel, days_back, True)
-        
-    def run_channel_scan_worker(self, channel, days_back, force_refresh):
+    # Find Clips from VODs (Find VODs Button)    
+    def run_find_vods_worker(self, channel, days_back):
         try:
             self.safe_update_channel_scan_status(f"Scanning {channel} for VODs in the last {days_back} days", "#2ecc71")
-            from datetime import datetime
-
-            cached_vods = load_channel_cache(channel)
-            stale = is_cache_stale(channel)
-            
-            new_vods = []
-            if stale or force_refresh:
-                self.safe_update_channel_scan_status(f"Fetching VODs from YouTube via yt-dlp", "#2ecc71")
-                if cached_vods and not force_refresh:
-                    cached_vods.sort(key=lambda x: x['date'], reverse=True)
-                    if len(cached_vods) > 0:
-                        try:
-                            cached_date = datetime.strptime(cached_vods[0]['date'], "%Y-%m-%d")
-                        except Exception as e:
-                            logger.warning(f"Could not parse most recent date from cache: {e}")
-
-                vod_playlist = fetch_vod_playlist(channel, days_back)
-
-                self.safe_update_channel_scan_status(f"Finding VODs for clipping", "#2ecc71")
-                new_vods = process_channel_vods(vod_playlist)
-            else:
-                self.safe_update_channel_scan_status(f"Cache is fresh, loading from local file", "#2ecc71")
-
-            all_vods = new_vods + cached_vods
+            force_refresh = self.cache_refresh_checkbox.get()
+            save_last_channel(channel)
+            playlist_vods = fetch_vod_playlist(channel, days_back, force_refresh)
 
             # Remove duplicates based on video_id
             seen_ids = set()
             unique_vods = []
-            for vod in all_vods:
-                if vod['video_id'] not in seen_ids:
-                    seen_ids.add(vod['video_id'])
+            for vod in playlist_vods:
+                if vod.video_id not in seen_ids:
+                    seen_ids.add(vod.video_id)
                     unique_vods.append(vod)
 
-            unique_vods.sort(key=lambda x: x['date'], reverse=True)
+            #Store the new VODs list after removing duplicates
+            self.playlist_vods = unique_vods
 
-            # Filter unique_vods to only show within the days_back limit
-            filtered_vods = []
-            for vod in unique_vods:
-                try:
-                    vod_date = datetime.strptime(vod['date'], "%Y-%m-%d")
-                    if vod_date >= target_date:
-                        filtered_vods.append(vod)
-                except:
-                    # Keep if we can't parse the date
-                    filtered_vods.append(vod)
+            #Filter for Vertical VODs only
+            self.safe_update_channel_scan_status(f"Finding VODs for clipping", "#2ecc71")
+            self.playlist_vertical_vods = find_vertical_valid_vods(channel, self.playlist_vods, days_back)
+            self.safe_update_channel_scan_status(f"Found {len(self.playlist_vertical_vods )} Vertical VODs within the last {days_back} days", "#2ecc71")
 
-            self.safe_update_channel_scan_status(f"Found {len(filtered_vods)} VODs within the last {days_back} days", "#2ecc71")
-
-            self.scraped_vod_options = filtered_vods
-
-            # Save the cache and last channel
-            # We want to save the entire list of VODs (all_vods), not just the filtered ones
-            save_channel_cache(channel, unique_vods)
-            save_last_channel(channel)
-
-            display_titles = [f"[{v['date']}] {v['title']}..." for v in self.scraped_vod_options]
+            display_titles = [f"[{v['date']}] {v['title']}..." for v in self.playlist_vertical_vods]
 
             self.after(0, lambda: self.vod_select_dropdown.configure(values=display_titles))
             if display_titles:
                 self.after(0, lambda: self.vod_select_dropdown.set(display_titles[0]))
-                self.after(0, lambda: self.on_vod_dropdown_selected(display_titles[0]))
                 # --- NEW: Enable the run button since VODs are loaded ---
                 self.after(0, lambda: self.run_ai_btn.configure(state="normal"))
             else:
@@ -293,8 +240,8 @@ class ClipYT(ctk.CTk):
             self.after(0, lambda: self.run_ai_btn.configure(state="disabled"))
         finally:
             self.after(0, lambda: self.scan_channel_btn.configure(state="normal", text="🔍 Fetch Recent Live VODs"))
-            self.after(0, lambda: self.refresh_channel_btn.configure(state="normal", text="🔄 Refresh Cache"))
 
+    # Store Clips to Google Sheets Button
     def start_ai_ingestion_thread(self):
         title = self.new_stream_title.get().strip()
         date = self.new_stream_date.get().strip()
@@ -318,6 +265,7 @@ class ClipYT(ctk.CTk):
         self.run_ai_btn.configure(state="disabled", text="⏳ Running Pipeline Ingestion...")
         self.executor.submit(self.run_single_ai_ingestion, title, captions_url, video_id, date, poster, url, count, min_sec, max_sec, scan_bef, scan_aft)
 
+    # Find & Make All Clips button
     def start_batch_range_thread(self):
         channel = self.batch_channel_field.get().strip()
         months_input = self.batch_range_field.get().strip()
@@ -339,13 +287,22 @@ class ClipYT(ctk.CTk):
 
         self.executor.submit(self._background_scrape_and_verify, channel, months_input, count, min_sec, max_sec, scan_bef, scan_aft)
 
+    # Find & Make All Clips button
     def _background_scrape_and_verify(self, channel, months_input, count, min_sec, max_sec, scan_bef, scan_aft):
         try:
             lookback_months = int(str(months_input).strip())
             start_threshold = dt_date.today() - relativedelta(months=lookback_months)
-            
-            vod_playlist = fetch_vod_playlist(channel, days_back=start_threshold)
-            all_scraped_vods = process_channel_vods(vod_playlist)
+
+            playlist_cache_stale = is_playlist_cache_stale(channel) 
+            is_vod_cache_stale = is_vod_cache_stale
+
+            vod_playlist = load_channel_playlist_cache(channel)
+            all_scraped_vods = load_channel_vod_cache(channel)
+
+            if vod_playlist & all_scraped_vods is None:
+                vod_playlist = fetch_vod_playlist(channel, days_back=start_threshold)
+                all_scraped_vods = find_vertical_valid_vods(channel, vod_playlist, start_threshold)
+
             target_batch = []
             
             for vod in all_scraped_vods:
@@ -377,6 +334,7 @@ class ClipYT(ctk.CTk):
             self.after(0, lambda err=e: self.show_error_popup(f"Scrape Error:\n\n{str(err)}"))
             self.after(0, self.finalize_batch_ui)
 
+    # Find & Make All Clips Button
     def execute_verified_batch_processing(self, verified_streams, count, min_sec, max_sec, scan_bef, scan_aft):
         if not verified_streams:
             self.finalize_batch_ui()
@@ -385,18 +343,25 @@ class ClipYT(ctk.CTk):
         self.run_batch_range_btn.configure(state="disabled", text="⚙️ Running Batch Automation...")
         self.executor.submit(self.run_batch_range_ingestion, verified_streams, count, min_sec, max_sec, scan_bef, scan_aft)
 
+    # DEAD CODE - NOTHING CALLS THIS METHOD
     def start_single_clip_pipeline(self, local_vod_path, row, filename, target_folder_id):
         self.safe_update_status("Running single processing task...", "#3498db")
         self.executor.submit(self.execute_clip_pipeline, local_vod_path, row, filename, target_folder_id)
 
+    # App / UI Init
     def __init__(self):
         super().__init__()
         self.title("Local Stream Clipper Studio")
-        self.geometry("1300x750")
+        self.geometry("675x1200")
         ctk.set_appearance_mode("dark")
         
         self.executor = ThreadPoolExecutor(max_workers=4)
         
+        self.header_font = ctk.CTkFont(family="Consolas", size=24)
+        self.label_font = ctk.CTkFont(family="Segoe UI Semibold", size=16)
+        self.small_light_font = ctk.CTkFont(family="Segoe UI Light", size=11)
+        self.button_font = ctk.CTkFont(family="Consolas", size=16, weight="bold")
+
         self.raw_headers = []
         self.current_column_order = []
         self.current_clips_data = []
@@ -418,12 +383,14 @@ class ClipYT(ctk.CTk):
         self.tab_control = ctk.CTkTabview(self)
         self.tab_control.pack(padx=10, pady=10, fill="both", expand=True)
         
-        self.find_clip_tab = self.tab_control.add("Find Clips")
+        self.find_vods_tab = self.tab_control.add("Find VODs")
         self.studio_tab = self.tab_control.add("Make Clips")
         self.batch_tab = self.tab_control.add("Find & Make All Clips")
 
+        self.setup_find_vod_ui()
+
         self.setup_studio_ui()
-        self.setup_find_clip_ui()
+        
         self.setup_batch_range_ui()
 
         self.connect_to_google()
@@ -434,6 +401,7 @@ class ClipYT(ctk.CTk):
 
         self.refresh_worksheet_dropdowns()
 
+    # Batch Worksheet Dropdown Selection Event
     def _fetch_broadcast_date(self, choice):
         all_streams_meta = self.stream_list_tab.get_all_records()
         for item in all_streams_meta:
@@ -441,6 +409,7 @@ class ClipYT(ctk.CTk):
                 self.active_broadcast_date = str(item.get("Broadcast Date", item.get("Date", ""))).strip()
                 break
 
+    # Batch Worksheet Dropdown Selection Event
     def _fetch_or_create_worksheet(self, choice):
         try:
             target_tab = self.sheet.worksheet(choice)
@@ -474,6 +443,7 @@ class ClipYT(ctk.CTk):
             except Exception as f_err:
                 logger.error(f"[SHEETS WARNING] Standalone placeholder style intercept bypassed: {str(f_err)}")
 
+    # Batch Worksheet Dropdown Selection Event
     def _apply_layout_preferences(self):
         if os.path.exists(config.layout_cache_file):
             try:
@@ -500,6 +470,7 @@ class ClipYT(ctk.CTk):
                 if h not in self.column_visibility:
                     self.column_visibility[h] = True
 
+    # Batch Worksheet Dropdown Selection Event
     def _prepare_drive_folder(self, choice):
         folder_key = f"{self.active_broadcast_date}_{choice}"
         if folder_key not in self.cached_folder_ids:
@@ -511,6 +482,7 @@ class ClipYT(ctk.CTk):
         self.current_drive_cache = existing_files_cache
         self.current_folder_id = target_folder_id
 
+    # Batch Worksheet Dropdown Selection Event
     def _update_ui_for_local_vod(self, expected_local_vod, safe_title):
         if not os.path.exists(expected_local_vod):
             self.source_file_exists = False
@@ -525,6 +497,7 @@ class ClipYT(ctk.CTk):
             self.after(0, lambda: self.batch_btn.configure(state="normal"))
             self.after(0, lambda: self.check_source_btn.configure(state="disabled"))
 
+    # Batch Worksheet Dropdown Selection Event
     def load_stream_clips(self):
         choice = self.active_choice
         if not choice: return
@@ -549,6 +522,7 @@ class ClipYT(ctk.CTk):
         except Exception as e:
             self.after(0, lambda e_val=e: self.show_error_popup(f"Data Retrieval Exception:\n{str(e_val)}"))
 
+    # Make VOD Clips UI Setup
     def setup_studio_ui(self):
         self.studio_tab.grid_columnconfigure(0, weight=1)
         self.studio_tab.grid_rowconfigure(2, weight=1)
@@ -558,12 +532,8 @@ class ClipYT(ctk.CTk):
         self.top_bar.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="ew") # Adjust row/column if needed
 
         # 2. NOW HANG THE PICTURE: Add the label inside self.top_bar
-        self.label = ctk.CTkLabel(self.top_bar, text="Select Active Stream Grid:", font=("Helvetica", 16, "bold"))
+        self.label = ctk.CTkLabel(self.top_bar, text="Select Active Stream Grid:", font=self.label_font)
         self.label.grid(row=0, column=0, padx=10, pady=10) # Adjust grid settings as needed
-
-        # 3. AND THEN ADD THE NEW GRID WE JUST MADE
-        self.clip_grid = ClipDataGrid(self.studio_tab, width=900, height=500) 
-        self.clip_grid.grid(row=1, column=0, padx=20, pady=(0, 20), sticky="nsew")
 
         # --- NEW UI TOGGLE ---
         self.enable_qa_var = ctk.StringVar(value="off")
@@ -582,6 +552,10 @@ class ClipYT(ctk.CTk):
         self.dropdown = ctk.CTkOptionMenu(self.studio_tab, values=["Loading lists..."])
         self.dropdown.grid(row=1, column=0, padx=20, pady=5, sticky="ew")
 
+                # 3. AND THEN ADD THE NEW GRID WE JUST MADE
+        self.clip_grid = ClipDataGrid(self.studio_tab, width=900, height=500) 
+        self.clip_grid.grid(row=2, column=0, padx=20, pady=(0, 20), sticky="nsew")
+
         self.outer_container = ctk.CTkFrame(self.studio_tab, fg_color="#1d1d1d")
         self.outer_container.grid(row=2, column=0, padx=20, pady=15, sticky="nsew")
         self.outer_container.grid_columnconfigure(0, weight=1)
@@ -599,122 +573,114 @@ class ClipYT(ctk.CTk):
         self.table_content_frame = None
 
         self.status_var = tk.StringVar(value="Status: Ready")
-        self.status_label = ctk.CTkLabel(self.studio_tab, textvariable=self.status_var, font=("Helvetica", 12, "italic"))
+        self.status_label = ctk.CTkLabel(self.studio_tab, textvariable=self.status_var, font=self.small_light_font)
         self.status_label.grid(row=3, column=0, padx=20, pady=10, sticky="w")
 
-    def setup_find_clip_ui(self):
-        self.find_clip_tab.grid_columnconfigure(0, weight=1)
-
-        channel_frame = ctk.CTkFrame(self.find_clip_tab)
-        channel_frame.grid(row=0, column=0, padx=20, pady=(15, 5), sticky="ew")
+    # Find VOD UI Setup
+    def setup_find_vod_ui(self):
+        self.find_vods_tab.grid_columnconfigure(0, weight=1)
         
-        # --- MAGIC LAYOUT FIX ---
-        # Make the URL text box column expand, pushing the right side flush to the edge
-        channel_frame.grid_columnconfigure(1, weight=1)
+        # --- FINDVOD CHANNEL FRAME
+        findvod_channel_frame = ctk.CTkFrame(self.find_vods_tab)
+        findvod_channel_frame.grid(row=0, column=0, padx=20, sticky="ew")
 
-        # --- ROW 0: The Fetching Controls ---
-        ctk.CTkLabel(channel_frame, text="Scan Channel Handle / URL:", font=("Helvetica", 12, "bold")).grid(row=0, column=0, padx=15, pady=(15, 5), sticky="e")
+        ctk.CTkLabel(findvod_channel_frame, text="YouTube Channel Handle/URL:", font=self.label_font).grid(row=0, column=0, padx=15, pady=(15, 5), sticky="w")
         
-        self.channel_input_field = ctk.CTkEntry(channel_frame, placeholder_text="e.g., @SpacesAreEvil or channel URL link")
+        self.channel_input_field = ctk.CTkEntry(findvod_channel_frame, placeholder_text="e.g., @<ChannelName> or Channel URL", font=self.label_font)
         # Set sticky="ew" so the text box stretches dynamically to fill the empty space
-        self.channel_input_field.grid(row=0, column=1, padx=5, pady=(15, 5), sticky="ew")
+        self.channel_input_field.grid(row=0, column=1, columnspan=3, padx=5, pady=(15, 5), sticky="ew")
         last_channel = load_last_channel()
         if last_channel:
             self.channel_input_field.insert(0, last_channel)
-            cached_vods = load_channel_cache(last_channel)
+            cached_vods = load_channel_vod_cache(last_channel)
             if cached_vods:
                 self.scraped_vod_options = cached_vods
                 display_titles = [f"[{v['date']}] {v['title']}..." for v in self.scraped_vod_options]
-
+                
                 # Setup dropdown and ai logic if cache exists
                 self.after(0, lambda: self.vod_select_dropdown.configure(values=display_titles))
                 self.after(0, lambda: self.vod_select_dropdown.set(display_titles[0]))
-                self.after(0, lambda: self.on_vod_dropdown_selected(display_titles[0]))
                 self.after(0, lambda: self.run_ai_btn.configure(state="normal"))
-                self.after(0, lambda: self.safe_update_channel_scan_status(f"Loaded {len(cached_vods)} VODs from cache for {last_channel}", "#2ecc71"))
-        else:
-            self.channel_input_field.insert(0, "@SpacesAreEvil")
+                self.after(0, lambda: self.safe_update_channel_scan_status(f"Loaded {len(cached_vods)} VODs from cache for {last_channel}", "#2ecc71"))  
 
-        ctk.CTkLabel(channel_frame, text="Scan X Days Back:", font=("Helvetica", 11, "bold")).grid(row=0, column=2, padx=(10, 2), pady=(15, 5), sticky="e")
-        self.channel_limit_field = ctk.CTkEntry(channel_frame, width=50)
+        ctk.CTkLabel(findvod_channel_frame, text="Scan Window:", font=self.label_font).grid(row=1, column=0, padx=(40, 1), pady=(15, 5), sticky="ew")
+        self.channel_limit_field = ctk.CTkEntry(findvod_channel_frame, width=50, font=self.label_font)
         self.channel_limit_field.insert(0, "30")
-        self.channel_limit_field.grid(row=0, column=3, padx=(0, 10), pady=(15, 5), sticky="w")
+        self.channel_limit_field.grid(row=1, column=1, padx=(5, 5), pady=(15, 5), sticky="ew")
+        ctk.CTkLabel(findvod_channel_frame, text="Days", font=self.label_font).grid(row=1, column=2, padx=(1, 40), pady=(15, 5), sticky="ew")
 
-        self.scan_channel_btn = ctk.CTkButton(channel_frame, text="🔍 Fetch Recent Live VODs", command=self.start_channel_scan_thread)
-        self.scan_channel_btn.grid(row=0, column=4, padx=(0, 5), pady=(15, 5), sticky="e") 
+        self.cache_refresh_checkbox = ctk.CTkCheckBox(findvod_channel_frame, text="Force Cache Refresh", onvalue=True, offvalue=False, font=self.label_font)
+        self.cache_refresh_checkbox.grid(row=1, column=3, padx=(1, 40), pady=(15, 5), sticky="ew")
 
-        self.refresh_channel_btn = ctk.CTkButton(channel_frame, text="🔄 Refresh Cache", command=self.start_channel_refresh_thread)
-        self.refresh_channel_btn.grid(row=0, column=5, padx=(0, 5), pady=(15, 5), sticky="e")
+        # FINDVOD BUTTON FRAME
+        findvod_searchbutton_frame = ctk.CTkFrame(self.find_vods_tab)
+        findvod_searchbutton_frame.grid(row=1, column=0, padx=20, sticky="ew")
+        findvod_searchbutton_frame.columnconfigure((0,4), weight=1)
 
-        # --- ROW 1: The Selection Dropdown ---
-        ctk.CTkLabel(channel_frame, text="Select Target Video:", font=("Helvetica", 11, "bold")).grid(row=1, column=0, padx=15, pady=(15, 5), sticky="w")
+        self.scan_channel_btn = ctk.CTkButton(findvod_searchbutton_frame, text="🔍 Find VODs", font=self.button_font, command=self.start_channel_scan_thread)
+        self.scan_channel_btn.grid(row=0, column=1, columnspan=2, padx=(15, 5), pady=(15, 5), ipady=30, ipadx=100, sticky="ew") 
+
+        # FINDVOD DROPDOWN FRAME
+        findvod_dropdown_frame = ctk.CTkFrame(self.find_vods_tab)
+        findvod_dropdown_frame.grid(row=2, column=0, padx=20, sticky="ew")
+        findvod_dropdown_frame.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(findvod_dropdown_frame, text="Select Target Video:", font=self.label_font).grid(row=0, column=0, padx=15, pady=(15, 5), sticky="w")
         
-        self.vod_select_dropdown = ctk.CTkOptionMenu(channel_frame, values=["Scan channel first..."], command=self.on_vod_dropdown_selected)
-        # Span the dropdown across the 3 right-most columns, and stick it to the East edge
-        self.vod_select_dropdown.grid(row=1, column=1, columnspan=4, padx=5, pady=(15, 5), sticky="ew")
+        self.vod_select_dropdown = ctk.CTkOptionMenu(findvod_dropdown_frame, values=["Scan channel first..."], font=self.label_font)
+        self.vod_select_dropdown.grid(row=0, column=1, padx=5, pady=(15, 5), sticky="ew")
 
-        meta_frame = ctk.CTkFrame(self.find_clip_tab)
-        meta_frame.grid(row=1, column=0, padx=20, pady=10, sticky="nsew")
+        # --- CLIPPING CONTROL FRAME
+        clip_control_frame = ctk.CTkFrame(self.find_vods_tab)
+        clip_control_frame.grid(row=3, column=0, padx=20, pady=10, sticky="ew")
+    
         
-        ctk.CTkLabel(meta_frame, text="Stream Title:", font=("Helvetica", 11, "bold")).grid(row=0, column=0, padx=15, pady=10, sticky="e")
-        self.new_stream_title = ctk.CTkEntry(meta_frame, placeholder_text="Worksheet Tab Name", width=250)
-        self.new_stream_title.grid(row=0, column=1, padx=5, pady=10, sticky="w")
+        ctk.CTkLabel(clip_control_frame, text="VOD Clipping Controls", font=self.label_font).grid(row=0, column=0, padx=10, pady=5, sticky="ew")
 
-        ctk.CTkLabel(meta_frame, text="Broadcast Date:", font=("Helvetica", 11, "bold")).grid(row=0, column=2, padx=10, pady=5, sticky="e")
-        self.new_stream_date = ctk.CTkEntry(meta_frame, placeholder_text="YYYY-MM-DD", width=140)
-        self.new_stream_date.grid(row=0, column=3, padx=5, pady=5, sticky="w")
-
-        ctk.CTkLabel(meta_frame, text="Posted By Creator:", font=("Helvetica", 11, "bold")).grid(row=0, column=4, padx=10, pady=5, sticky="e")
-        self.new_stream_poster = ctk.CTkEntry(meta_frame, width=150)
-        self.new_stream_poster.grid(row=0, column=5, padx=5, pady=5, sticky="w")
-
-        ctk.CTkLabel(meta_frame, text="YouTube URL Link:", font=("Helvetica", 11, "bold")).grid(row=1, column=0, padx=10, pady=5, sticky="e")
-        self.new_stream_url = ctk.CTkEntry(meta_frame, placeholder_text="https://www.youtube.com/watch?v=...", width=250)
-        self.new_stream_url.grid(row=1, column=1, columnspan=2, padx=5, pady=5, sticky="ew")
-
-        ctk.CTkLabel(meta_frame, text="Target Clip Count:", font=("Helvetica", 11, "bold")).grid(row=1, column=3, padx=10, pady=5, sticky="e")
-        self.param_clip_count = ctk.CTkEntry(meta_frame, width=60)
+        ctk.CTkLabel(clip_control_frame, text="Target Clip Count:", font=self.label_font).grid(row=1, column=0, padx=10, pady=5, sticky="ew")
+        self.param_clip_count = ctk.CTkEntry(clip_control_frame, width=60)
         self.param_clip_count.insert(0, "10")
-        self.param_clip_count.grid(row=1, column=4, padx=5, pady=5, sticky="w")
+        self.param_clip_count.grid(row=1, column=1, padx=5, pady=5, sticky="w")
 
-        ctk.CTkLabel(meta_frame, text="Clip Size Limits (Sec):", font=("Helvetica", 11, "bold")).grid(row=2, column=0, padx=10, pady=5, sticky="e")
-        size_bounds_frame = ctk.CTkFrame(meta_frame, fg_color="transparent")
-        size_bounds_frame.grid(row=2, column=1, sticky="w")
-        
-        self.param_min_sec = ctk.CTkEntry(size_bounds_frame, width=50)
+        ctk.CTkLabel(clip_control_frame, text="Clip Size Limits (Sec):", font=self.label_font).grid(row=2, column=0, padx=10, pady=5, sticky="ew")
+        ctk.CTkLabel(clip_control_frame, text="Min", font=self.label_font).grid(row=2, column=1, padx=10, pady=5, sticky="ew")       
+        self.param_min_sec = ctk.CTkEntry(clip_control_frame, width=50)
         self.param_min_sec.insert(0, "60")
-        self.param_min_sec.pack(side="left")
-        ctk.CTkLabel(size_bounds_frame, text=" Min  /  Max ").pack(side="left", padx=5)
-        self.param_max_sec = ctk.CTkEntry(size_bounds_frame, width=50)
+        self.param_min_sec.grid(row=2, column=2, padx=10, pady=5, sticky="ew")
+        ctk.CTkLabel(clip_control_frame, text="Max", font=self.label_font).grid(row=3, column=1, padx=10, pady=5, sticky="ew") 
+        self.param_max_sec = ctk.CTkEntry(clip_control_frame, width=50)
         self.param_max_sec.insert(0, "180")
-        self.param_max_sec.pack(side="left")
+        self.param_max_sec.grid(row=3, column=2, padx=10, pady=5, sticky="ew")
 
-        ctk.CTkLabel(meta_frame, text="Context Window Scan (Sec):", font=("Helvetica", 11, "bold")).grid(row=2, column=2, padx=10, pady=5, sticky="e")
-        scan_bounds_frame = ctk.CTkFrame(meta_frame, fg_color="transparent")
-        scan_bounds_frame.grid(row=2, column=3, columnspan=3, sticky="w")
-        
-        self.param_scan_before = ctk.CTkEntry(scan_bounds_frame, width=50)
+        ctk.CTkLabel(clip_control_frame, text="Context Window Scan (Sec):", font=self.label_font).grid(row=4, column=0, padx=10, pady=5, sticky="e")        
+        ctk.CTkLabel(clip_control_frame, text=" Before", font=self.label_font).grid(row=4, column=1, padx=10, pady=5, sticky="e")
+        self.param_scan_before = ctk.CTkEntry(clip_control_frame, width=50)
         self.param_scan_before.insert(0, "60")
-        self.param_scan_before.pack(side="left")
-        ctk.CTkLabel(scan_bounds_frame, text=" Before  /  After ").pack(side="left", padx=5)
-        self.param_scan_after = ctk.CTkEntry(scan_bounds_frame, width=50)
+        self.param_scan_before.grid(row=4, column=2, padx=10, pady=5, sticky="ew")
+        ctk.CTkLabel(clip_control_frame, text="After", font=self.label_font).grid(row=5, column=1, padx=10, pady=5, sticky="e")
+        self.param_scan_after = ctk.CTkEntry(clip_control_frame, width=50)
         self.param_scan_after.insert(0, "60")
-        self.param_scan_after.pack(side="left")
+        self.param_scan_after.grid(row=5, column=2, padx=10, pady=5, sticky="ew")
 
-        self.run_ai_btn = ctk.CTkButton(self.find_clip_tab, text="🎬 Find clips from YouTube VOD and save to Google Sheets", fg_color="#2ecc71", hover_color="#27ae60", height=45, state="disabled", command=self.start_ai_ingestion_thread)
-        self.run_ai_btn.grid(row=2, column=0, padx=20, pady=20, sticky="ew")
+        ### --- MAKE CLIPS BUTTON
+
+        self.run_ai_btn = ctk.CTkButton(clip_control_frame, text="🎬 Find clips from YouTube VOD and save to Google Sheets", font=self.button_font, fg_color="#2ecc71", hover_color="#27ae60", height=45, state="disabled", command=self.start_ai_ingestion_thread)
+        self.run_ai_btn.grid(row=6, column=0, columnspan=4, padx=20, pady=20, sticky="ew")
+
+        #ROW 3
 
         self.channel_scan_var = tk.StringVar(value="Status: Waiting for YouTube Channel Name or URL")
-        self.channel_scan_label = ctk.CTkLabel(self.find_clip_tab, textvariable=self.channel_scan_var, font=("Helvetica", 12, "italic"))
-        self.channel_scan_label.grid(row=3, column=0, padx=20, pady=5, sticky="w")
+        self.channel_scan_label = ctk.CTkLabel(self.find_vods_tab, textvariable=self.channel_scan_var, font=("Helvetica", 12, "italic"))
+        self.channel_scan_label.grid(row=4, column=0, padx=20, pady=5, sticky="w")
 
+    # Batch Process UI Setup
     def setup_batch_range_ui(self):
         self.batch_tab.grid_columnconfigure(0, weight=1)
 
         info_box = ctk.CTkFrame(self.batch_tab)
         info_box.grid(row=0, column=0, padx=20, pady=15, sticky="ew")
         
-        lbl = ctk.CTkLabel(info_box, text="Batch Make Clips Automation Studio", font=("Helvetica", 16, "bold"), text_color="#3498db")
+        lbl = ctk.CTkLabel(info_box, text="Batch Make Clips Automation Studio", font=self.header_font, text_color="#3498db")
         lbl.pack(padx=15, pady=(10, 2), anchor="w")
         sub_lbl = ctk.CTkLabel(info_box, text="Asynchronously scrapes target metrics backwards from today's system calendar date across channel history segments.", font=("Helvetica", 11), text_color="#95a5a6")
         sub_lbl.pack(padx=15, pady=(0, 10), anchor="w")
@@ -773,6 +739,7 @@ class ClipYT(ctk.CTk):
         self.batch_progress_bar.set(0)
         self.batch_progress_bar.grid_remove() 
 
+    # Process All Pending VOD Clips
     def run_batch_worker(self):
         safe_title = clean_filename(self.active_choice)
         expected_local_vod = os.path.join(config.input_vods_dir, f"{safe_title}.mp4")
@@ -928,6 +895,7 @@ class ClipYT(ctk.CTk):
         self.safe_update_status("Batch Success!", "#2ecc71")
         self.after(0, self.finalize_batch_ui)
 
+    # Store Clips to Google Sheets Button
     def run_single_ai_ingestion(self, title, caption_url, video_id, date, poster, url, count, min_sec, max_sec, scan_bef, scan_aft):
         try:
             logger.info(f"[GEMINI PIPELINE] Initializing single pass ingestion for: '{title}'")
@@ -956,6 +924,7 @@ class ClipYT(ctk.CTk):
         finally:
             self.after(0, lambda: self.run_ai_btn.configure(state="normal", text="🎬 Find clips from YouTube VOD and save to Google Sheets"))
 
+    # Find & Make All Clips Button
     def run_batch_range_ingestion(self, verified_batch, count, min_sec, max_sec, scan_bef, scan_aft):
         try:
             total_batch_count = len(verified_batch)
@@ -1006,6 +975,7 @@ class ClipYT(ctk.CTk):
             self.after(0, self.finalize_batch_ui)
             self.after(0, lambda: self.run_batch_range_btn.configure(state="normal", text="🚀 Find & Make All Clips"))
 
+    # Store Clips to Google Sheets Button
     def _query_gemini_strategist(self, transcript_payload, title, creator, url, count, min_sec, max_sec, scan_bef, scan_aft):
         transcript_hash = hashlib.sha256(transcript_payload.encode('utf-8')).hexdigest()
         video_id = url.split("v=")[-1] if "v=" in url else "unknown_video"
@@ -1069,6 +1039,7 @@ class ClipYT(ctk.CTk):
 
         return extracted_clips
 
+    #run_single_range_ingestion and run_batch_range_ingestion
     def _commit_clips_to_spreadsheet(self, title, date_str, url, clip_rows):
         is_new_tab = False
         headers = [
@@ -1127,6 +1098,7 @@ class ClipYT(ctk.CTk):
         except Exception as format_err:
             logger.error(f"[SHEETS WARNING] Layout bypass on '{title}': {str(format_err)}")
 
+    #start_single_clip_pipeline which is DEAD CODE
     def execute_clip_pipeline(self, local_vod_path, row, filename, target_folder_id):
         needs_reslice = "New Timestamp Start" in row and row["New Timestamp Start"]
 
